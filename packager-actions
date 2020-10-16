@@ -1,0 +1,2 @@
+packager      ALL = NOPASSWD: /usr/sbin/makepkg *
+packager      ALL = NOPASSWD: /usr/sbin/pacman  *

@@ -1,16 +1,19 @@
-FROM archlinux:20200205
-RUN pacman -Syu --noconfirm
-RUN pacman -S --noconfirm git base-devel
-RUN pacman -S --noconfirm go
+FROM archlinux:20200205 AS arch-ghc-build-env
 
-RUN useradd --create-home packager
+RUN pacman -Sy --noconfirm archlinux-keyring
+RUN pacman -Su --noconfirm
+RUN pacman -S --noconfirm reflector
+RUN sh -c 'reflector --score 20 -f 8 --sort rate > /etc/pacman.d/mirrorlist'
+RUN pacman -S --noconfirm git base-devel go python python-sphinx libedit numactl exa
+
 # use all possible cores for subsequent package builds
 RUN sed -i 's,#MAKEFLAGS="-j2",MAKEFLAGS="-j$(nproc)",g' /etc/makepkg.conf
 # don't compress the packages built here
 RUN sed -i "s,PKGEXT='.pkg.tar.xz',PKGEXT='.pkg.tar',g" /etc/makepkg.conf
-RUN echo '' >> /etc/sudoers
-RUN echo 'packager      ALL = NOPASSWD: /usr/sbin/makepkg *' >> /etc/sudoers
-RUN echo 'packager      ALL = NOPASSWD: /usr/sbin/pacman *'  >> /etc/sudoers
+# set up the packager user
+RUN useradd --create-home packager
+COPY bashrc.sh /home/packager/.bashrc
+COPY packager-actions /etc/sudoers.d/
 
 USER packager
 WORKDIR /home/packager/
@@ -19,23 +22,17 @@ WORKDIR /home/packager/yay/
 RUN makepkg -i --noconfirm
 
 WORKDIR /home/packager/
-RUN yay -S --noconfirm ghcup-git exa
-COPY bashrc.sh .
-RUN mv ~/bashrc.sh ~/.bashrc
+RUN yay -S --noconfirm ghcup-git stack-bin
 
 RUN ghcup install 8.6.5
 RUN ghcup set 8.6.5
 RUN ghcup install-cabal
 
-RUN git clone --recursive --depth 1 -b ghc-8.8.3-release https://gitlab.haskell.org/ghc/ghc
-RUN yay -S --noconfirm python python-sphinx libedit numactl
-RUN yay -S --noconfirm stack-bin
 
 USER root
 RUN ln -s /home/packager/.ghcup/bin/ghc     /usr/sbin/ghc
 RUN ln -s /home/packager/.ghcup/bin/ghc-pkg /usr/sbin/ghc-pkg
-RUN stack install --system-ghc alex
-RUN stack install --system-ghc happy
+RUN stack install --system-ghc alex happy
 RUN ln -s /root/.local/bin/alex             /usr/sbin/alex
 RUN ln -s /root/.local/bin/happy            /usr/sbin/happy
 RUN chmod a+x  /root/
@@ -44,9 +41,18 @@ RUN chmod a+x  /root/.local/bin/
 RUN chmod a+rx /root/.local/bin/alex
 RUN chmod a+rx /root/.local/bin/happy
 
+
+# build GHC
+FROM arch-ghc-build-env AS arch-ghc-cleanbuild
 USER packager
+WORKDIR /home/packager/
+RUN git clone --depth 1 -b ghc-8.8.4-release https://gitlab.haskell.org/ghc/ghc
 WORKDIR /home/packager/ghc/
+RUN git submodule update --init --recursive
+RUN git submodule sync
+
 RUN ./boot
 RUN ./configure
 RUN /home/packager/.ghcup/bin/cabal update
-RUN bash -c 'source ~/.bashrc; ./hadrian/build.sh -j'
+RUN bash -c 'source ~/.bashrc; ./hadrian/build.sh -j --flavour=quick'
+VOLUME /home/packager/ghc/
