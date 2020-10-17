@@ -46,13 +46,3 @@ RUN chmod a+rx /root/.local/bin/happy
 FROM arch-ghc-build-env AS arch-ghc-cleanbuild
 USER packager
 WORKDIR /home/packager/
-RUN git clone --depth 1 -b ghc-8.8.4-release https://gitlab.haskell.org/ghc/ghc
-WORKDIR /home/packager/ghc/
-RUN git submodule update --init --recursive
-RUN git submodule sync
-
-RUN ./boot
-RUN ./configure
-RUN /home/packager/.ghcup/bin/cabal update
-RUN bash -c 'source ~/.bashrc; ./hadrian/build.sh -j --flavour=quick'
-VOLUME /home/packager/ghc/
