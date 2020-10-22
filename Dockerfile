@@ -46,3 +46,4 @@ RUN chmod a+rx /root/.local/bin/happy
 FROM arch-ghc-build-env AS arch-ghc-cleanbuild
 USER packager
 WORKDIR /home/packager/
+RUN source /home/packager/.bashrc && cabal update
