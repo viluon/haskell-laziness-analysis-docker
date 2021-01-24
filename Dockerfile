@@ -1,10 +1,11 @@
 FROM archlinux:20200205 AS arch-ghc-build-env
 
 RUN pacman -Sy --noconfirm archlinux-keyring
+RUN rm -rf /etc/pacman.d/gnupg; pacman-key --init; pacman-key --populate archlinux
 RUN pacman -Su --noconfirm
 RUN pacman -S --noconfirm reflector
 RUN sh -c 'reflector --score 20 -f 8 --sort rate > /etc/pacman.d/mirrorlist'
-RUN pacman -S --noconfirm git base-devel go python python-sphinx libedit numactl exa
+RUN pacman -S --needed --noconfirm git base-devel go python python-sphinx libedit numactl exa
 
 # use all possible cores for subsequent package builds
 RUN sed -i 's,#MAKEFLAGS="-j2",MAKEFLAGS="-j$(nproc)",g' /etc/makepkg.conf
@@ -22,11 +23,16 @@ WORKDIR /home/packager/yay/
 RUN makepkg -i --noconfirm
 
 WORKDIR /home/packager/
-RUN yay -S --noconfirm ghcup-git stack-bin
+RUN mkdir -p .ghcup/bin/
+RUN curl https://downloads.haskell.org/~ghcup/x86_64-linux-ghcup -o .ghcup/bin/ghcup
+RUN chmod +x .ghcup/bin/ghcup
+USER root
+RUN curl -sSL https://get.haskellstack.org/ | sh
+USER packager
 
-RUN ghcup install 8.6.5
-RUN ghcup set 8.6.5
-RUN ghcup install-cabal
+RUN .ghcup/bin/ghcup install ghc 8.6.5
+RUN .ghcup/bin/ghcup set 8.6.5
+RUN .ghcup/bin/ghcup install cabal
 
 
 USER root
