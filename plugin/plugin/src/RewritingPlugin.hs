@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TemplateHaskell #-}
 {- HLINT ignore "Use record patterns" -}
 
@@ -57,8 +58,11 @@ type MatchGroup = GHC.MatchGroup GHC.GhcTc LExpr
 type LExpr      = GHC.LHsExpr    GHC.GhcTc
 type Expr       = GHC.HsExpr     GHC.GhcTc
 
-traceExpr :: TH.ExpQ
-traceExpr = [| trace "rewriting-plugin says hello!" True |]
+entryExpr :: TH.ExpQ
+entryExpr = [| trace "rewriting-plugin says hello!" True |]
+
+exitExpr :: TH.ExpQ
+exitExpr = [| trace "exit point" |]
 
 -- | Check that an expression has the expected type.
 -- By Matthew Pickering as shown in plugin-constraint.
@@ -77,20 +81,23 @@ typecheckExpr t e = do
 
 indentWithRangle = unlines . fmap ("> " ++) . lines
 
+-- | Parse, rename, and typecheck a TH quoted expression.
+tc :: TH.ExpQ -> GHC.TcM LExpr
+tc expr = do
+  Right expr_ps <- fmap (GHC.convertToHsExpr GHC.Generated GHC.noSrcSpan)
+    $ GHC.liftIO
+    $ TH.runQ expr
+  -- rename the TH source
+  (expr_rn, _ ) <- GHC.rnLExpr expr_ps
+  -- typecheck
+  typecheckExpr GHC.boolTy expr_rn
+
 -- TODO: use optics
 rewrite :: GHC.LHsBinds GHC.GhcTc -> GHC.TcM (GHC.LHsBinds GHC.GhcTc)
 rewrite binds = do
-  Right trace_tru_ps <- fmap (GHC.convertToHsExpr GHC.Generated GHC.noSrcSpan)
-    $ GHC.liftIO
-    $ TH.runQ traceExpr
-
-  -- rename the TH source
-  (trace_tru_rn, _ ) <- GHC.rnLExpr trace_tru_ps
-  -- typecheck
-  trace_tru_tc <- typecheckExpr GHC.boolTy trace_tru_rn
-
-  let ep_guard = GHC.BodyStmt (error "element type of the rhs") trace_tru_tc (error "should be ?") (error "should be noSyntaxExpr")
-
+  entry <- tc entryExpr
+  exit  <- tc  exitExpr
+  let ep_guard = GHC.BodyStmt (error "element type of the rhs") entry (error "should be ?") (error "should be noSyntaxExpr")
   return $ go (GHC.L GHC.noSrcSpan ep_guard) binds
 
   where
@@ -134,50 +141,53 @@ rewrite binds = do
     unsupportedExtensionOf = error . ("unsupported extension of " ++)
 
     rewriteExitPoints :: Expr -> Expr
-    rewriteExitPoints e@ GHC.HsVar          {}         = wrapExitPoint e
-    rewriteExitPoints e@ GHC.HsUnboundVar   {}         = e -- will not compile with holes
-    rewriteExitPoints e@(GHC.HsConLikeOut   _ _)       = error "todo" -- not sure about this one
-    rewriteExitPoints e@ GHC.HsRecFld       {}         = wrapExitPoint e
-    rewriteExitPoints e@ GHC.HsOverLabel    {}         = notInUse
-    rewriteExitPoints e@ GHC.HsIPVar        {}         = notInUse
-    rewriteExitPoints e@ GHC.HsOverLit      {}         = wrapExitPoint e
-    rewriteExitPoints e@ GHC.HsLit          {}         = wrapExitPoint e
-    rewriteExitPoints e@(GHC.HsLam          x mg)      =
-      GHC.HsLam x $ rewriteMatchGroup rewriteExitPoints mg
-
-    rewriteExitPoints e@(GHC.HsLamCase      _ _)       = e
-    rewriteExitPoints e@(GHC.HsApp          _ _ _)     = e
-    rewriteExitPoints e@(GHC.HsAppType      _ _ _)     = e
-    rewriteExitPoints e@(GHC.OpApp          _ _ _ _)   = e
-    rewriteExitPoints e@(GHC.NegApp         _ _ _)     = e
-    rewriteExitPoints e@(GHC.HsPar          _ _)       = e
-    rewriteExitPoints e@(GHC.SectionL       _  _ _)    = e
-    rewriteExitPoints e@(GHC.SectionR       _ _ _)     = e
-    rewriteExitPoints e@(GHC.ExplicitTuple  _ _ _)     = e
-    rewriteExitPoints e@(GHC.ExplicitSum    _ _ _ _)   = e
-    rewriteExitPoints e@(GHC.HsCase         _ _ _)     = e
-    rewriteExitPoints e@(GHC.HsIf           _ _ _ _ _) = e
-    rewriteExitPoints e@(GHC.HsMultiIf      _ _)       = e
-    rewriteExitPoints e@(GHC.HsLet          _ _ _)     = e
-    rewriteExitPoints e@(GHC.HsDo           _ _ _)     = e
-    rewriteExitPoints e@(GHC.ExplicitList   _ _ _)     = e
-    rewriteExitPoints e@(GHC.RecordCon      _ _ _)     = e
-    rewriteExitPoints e@(GHC.RecordUpd      _ _ _)     = e
-    rewriteExitPoints e@(GHC.ExprWithTySig  _ _ _)     = e
-    rewriteExitPoints e@(GHC.ArithSeq       _ _ _)     = e
-    rewriteExitPoints e@(GHC.HsSCC          _ _ _ _)   = e
-    rewriteExitPoints e@(GHC.HsCoreAnn      _ _ _ _)   = e
-    rewriteExitPoints e@(GHC.HsBracket      _ _)       = e
-    rewriteExitPoints e@(GHC.HsRnBracketOut _ _ _)     = e
-    rewriteExitPoints e@(GHC.HsTcBracketOut _ _ _)     = e
-    rewriteExitPoints e@(GHC.HsSpliceE      _ _)       = e
-    rewriteExitPoints e@(GHC.HsProc         _ _ _)     = e
-    rewriteExitPoints e@(GHC.HsStatic       _ _)       = e
-    rewriteExitPoints e@(GHC.HsTick         _ _ _)     = e
-    rewriteExitPoints e@(GHC.HsBinTick      _ _ _ _)   = e
-    rewriteExitPoints e@(GHC.HsTickPragma   _ _ _ _ _) = e
-    rewriteExitPoints e@(GHC.HsWrap         _ _ _)     = e
-    rewriteExitPoints e@(GHC.XExpr          _)         = e
+    rewriteExitPoints e =
+      case e of
+        GHC.HsVar           {}              -> wrapExitPoint e
+        GHC.HsUnboundVar    {}              -> e -- will not compile with holes
+        (GHC.HsConLikeOut   _ _)            -> error "todo" -- not sure about this one
+        GHC.HsRecFld        {}              -> wrapExitPoint e
+        GHC.HsOverLabel     {}              -> notInUse
+        GHC.HsIPVar         {}              -> notInUse
+        GHC.HsOverLit       {}              -> wrapExitPoint e
+        GHC.HsLit           {}              -> wrapExitPoint e
+        (GHC.HsLam          x mg)           -> GHC.HsLam     x $ rewriteMatchGroup rewriteExitPoints mg
+        (GHC.HsLamCase      x mg)           -> GHC.HsLamCase x $ rewriteMatchGroup rewriteExitPoints mg
+        (GHC.HsApp          x f a)          -> GHC.HsApp     x f $ rewriteExitPoints <$> a
+        (GHC.HsAppType      x e wc)         -> GHC.HsAppType x (rewriteExitPoints <$> e) wc -- not sure about this one either
+        (GHC.OpApp          x l o r)        -> GHC.OpApp     x l o $ rewriteExitPoints <$> r
+        (GHC.NegApp         x e n)          -> GHC.NegApp    x (rewriteExitPoints <$> e) n
+        (GHC.HsPar          x e)            -> GHC.HsPar     x $ rewriteExitPoints <$> e
+        (GHC.SectionL       x e o)          -> GHC.SectionL  x (rewriteExitPoints <$> e) o
+        (GHC.SectionR       x o e)          -> GHC.SectionR  x o $ rewriteExitPoints <$> e
+        (GHC.ExplicitTuple  _ _ _)          -> e
+        (GHC.ExplicitSum    _ _ _ _)        -> e
+        (GHC.HsCase         x e mg)         -> GHC.HsCase x e (rewriteMatchGroup rewriteExitPoints mg)
+        (GHC.HsIf           x cond p th el) -> GHC.HsIf x cond p (rewriteExitPoints <$> th) (rewriteExitPoints <$> el)
+        (GHC.HsMultiIf      x rhss)         -> GHC.HsMultiIf x ((fmap . fmap . fmap) rw'' $ rhss)
+        (GHC.HsLet          x b e)          -> GHC.HsLet x b $ rewriteExitPoints <$> e
+        (GHC.HsDo           x n stmts)      -> error "todo, involves statements"
+        (GHC.ExplicitList   x _ _)          -> error "todo"
+          -- how do we actually deal with laziness? push traces to the leaves? the trouble is that the list is lazy,
+          -- so until (some of) its elements are evaluated, we have no clue as to whether the arguments in scope were
+          -- required or not. There also is no order to these evaluations.
+        (GHC.RecordCon      _ _ _)          -> e
+        (GHC.RecordUpd      _ _ _)          -> e
+        (GHC.ExprWithTySig  _ _ _)          -> e
+        (GHC.ArithSeq       _ _ _)          -> e
+        (GHC.HsSCC          _ _ _ _)        -> e
+        (GHC.HsCoreAnn      _ _ _ _)        -> e
+        (GHC.HsBracket      _ _)            -> e
+        (GHC.HsRnBracketOut _ _ _)          -> e
+        (GHC.HsTcBracketOut _ _ _)          -> e
+        (GHC.HsSpliceE      _ _)            -> e
+        (GHC.HsProc         _ _ _)          -> e
+        (GHC.HsStatic       _ _)            -> e
+        (GHC.HsTick         _ _ _)          -> e
+        (GHC.HsBinTick      _ _ _ _)        -> e
+        (GHC.HsTickPragma   _ _ _ _ _)      -> e
+        (GHC.HsWrap         x w e)          -> GHC.HsWrap x w $ rewriteExitPoints e -- TC output only
+        (GHC.XExpr          _)              -> e
 
     wrapExitPoint :: Expr -> Expr
     wrapExitPoint = id
