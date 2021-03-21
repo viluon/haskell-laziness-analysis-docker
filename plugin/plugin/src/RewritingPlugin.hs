@@ -7,18 +7,22 @@ module RewritingPlugin (plugin) where
 -- ghc
 import qualified GhcPlugins as GHC
 
+import qualified CoreUtils
 import qualified TcRnMonad  as GHC
 import qualified TcHsSyn    as GHC
 import qualified TcType     as GHC
 import qualified TcEvidence as GHC
-import qualified TcSMonad   as GHC hiding (tcLookupId)
+import qualified TcSMonad   as GHC hiding (tcLookupId, getTopEnv)
 import qualified TcSimplify as GHC
+import qualified TyCoRep    as GHC
 import qualified GHC.ThToHs as GHC
 import qualified RnExpr     as GHC
 import qualified TcExpr     as GHC
+import qualified Desugar    as GHC
 
 import qualified GHC
 
+-- syb
 -- syb
 import Data.Generics (everywhereM, listify, mkM)
 -- template-haskell
@@ -78,30 +82,117 @@ typecheckExpr t e = do
   -- Zonk to instantiate type variables
   GHC.zonkTopLExpr final_expr
 
+-- | Given a type-checked expression, pair the expression up with its Type.
+toTyped :: LExpr -> GHC.TcM (Maybe (LExpr, GHC.Type))
+toTyped e = do
+  hs_env <- GHC.getTopEnv
+  (_, mbe) <- GHC.liftIO $ GHC.deSugarExpr hs_env e
 
+  return $ (\x -> (e, CoreUtils.exprType x)) <$> mbe
+
+-- utility functions
 indentWithRangle = unlines . fmap ("> " ++) . lines
+notInUse = error "supposedly not in use after typechecking"
+unsupportedExtensionOf = error . ("unsupported extension of " ++)
+
 
 -- | Parse, rename, and typecheck a TH quoted expression.
-tc :: TH.ExpQ -> GHC.TcM LExpr
-tc expr = do
+tc :: GHC.Type -> TH.ExpQ -> GHC.TcM LExpr
+tc ty expr = do
   Right expr_ps <- fmap (GHC.convertToHsExpr GHC.Generated GHC.noSrcSpan)
     $ GHC.liftIO
     $ TH.runQ expr
   -- rename the TH source
   (expr_rn, _ ) <- GHC.rnLExpr expr_ps
   -- typecheck
-  typecheckExpr GHC.boolTy expr_rn
+  typecheckExpr ty expr_rn
 
 -- TODO: use optics
 rewrite :: GHC.LHsBinds GHC.GhcTc -> GHC.TcM (GHC.LHsBinds GHC.GhcTc)
 rewrite binds = do
-  entry <- tc entryExpr
-  exit  <- tc  exitExpr
+  entry <- tc GHC.boolTy entryExpr
   let ep_guard = GHC.BodyStmt (error "element type of the rhs") entry (error "should be ?") (error "should be noSyntaxExpr")
-  return $ go (GHC.L GHC.noSrcSpan ep_guard) binds
+  -- return $ go (GHC.L GHC.noSrcSpan ep_guard) binds
+  rewriteIdRefs
 
   where
-  go entryPointGuard = fmap . fmap $ rw rewriteExitPoints
+  -- goal: rewrite argument references to go through trace
+  -- plan:
+  --   - capture all bindings
+  --   - rewrite refs
+  --   - add a global mutable map
+  --   - count function calls via the map
+
+  isMatch :: Match -> Bool
+  isMatch GHC.Match {} = True
+  isMatch _ = False
+
+  boundVars = do
+    match <- listify isMatch binds
+    lpat <- GHC.m_pats match
+    lextract lpat
+    where
+      unl x = GHC.unLoc x
+
+      lextract :: GHC.LPat GHC.GhcTc -> [GHC.Id]
+      lextract x = extractIds . unl $ x
+
+      extractIds :: GHC.Pat GHC.GhcTc -> [GHC.Id]
+      extractIds  GHC.WildPat   {}                       = []
+      extractIds (GHC.VarPat   _ lid)                    = [unl lid]
+      extractIds (GHC.LazyPat  _ lpat)                   = lextract lpat
+      extractIds (GHC.AsPat    _ lid lpat)               = unl lid : lextract lpat
+      extractIds (GHC.ParPat   _ lpat)                   = lextract lpat
+      extractIds (GHC.BangPat  _ lpat)                   = lextract lpat
+      extractIds (GHC.ListPat  _ lpats)                  = do lpat <- lpats; lextract lpat
+      extractIds (GHC.TuplePat _ lpats _)                = do lpat <- lpats; lextract lpat
+      extractIds (GHC.SumPat   _ lpat _ _)               = lextract lpat
+      extractIds (GHC.ConPatIn _ details)                = error "todo"
+      -- HsConDetails (LPat GhcTc) (HsRecFields GhcTc (LPat GhcTc))
+      extractIds  GHC.ConPatOut {GHC.pat_args = details} = case details of
+                                                            GHC.InfixCon  lpatl lpatr -> lextract lpatl ++ lextract lpatr
+                                                            GHC.PrefixCon lpats       -> concatMap lextract lpats
+                                                            GHC.RecCon    r           -> error "todo"
+
+      extractIds (GHC.ViewPat   _ _ lpat)                = lextract lpat
+      extractIds  GHC.SplicePat {}                       = error "todo"
+      extractIds  GHC.LitPat    {}                       = []
+      extractIds  GHC.NPat      {}                       = []
+      extractIds  GHC.NPlusKPat {}                       = error "todo"
+      extractIds (GHC.SigPat   _ lpat _)                 = lextract lpat
+      extractIds (GHC.CoPat    _ _ pat _)                = extractIds pat
+      extractIds  GHC.XPat      {}                       = unsupportedExtensionOf "Pat"
+
+  rewriteIdRefs :: GHC.TcM (GHC.LHsBinds GHC.GhcTc)
+  rewriteIdRefs = everywhereM (mkM wrapRef) binds
+
+  wrapRef :: LExpr -> GHC.TcM LExpr
+  wrapRef v@(GHC.L _ (GHC.HsVar x lid)) | GHC.unLoc lid `elem` boundVars = do
+    Right expr_ps <- fmap (GHC.convertToHsExpr GHC.Generated GHC.noSrcSpan)
+      $ GHC.liftIO
+      $ TH.runQ [| trace "hello world" |]
+    -- rename the TH source
+    (expr_rn, _ ) <- GHC.rnLExpr expr_ps
+
+    -- obtain the type of the expression we're wrapping
+    Just (_, org_ty) <- toTyped v
+
+    let ty = foldr1 (GHC.mkFunTy GHC.VisArg) [org_ty, org_ty]
+
+    -- Typecheck the new expression and capture generated constraints
+    (unwrapped_expr, wanteds) <-
+      GHC.captureConstraints (GHC.tcMonoExpr expr_rn (GHC.Check (trace (GHC.showSDocUnsafe (GHC.ppr ty)) ty)))
+    -- Create the wrapper
+    wrapper <- GHC.mkWpLet . GHC.EvBinds . GHC.evBindMapBinds . snd
+                <$> GHC.runTcS ( GHC.solveWanteds wanteds )
+    -- Apply the wrapper
+    let final_expr = GHC.mkHsApp (GHC.mkLHsWrap wrapper unwrapped_expr) v
+    -- Zonk to instantiate type variables
+    GHC.zonkTopLExpr final_expr
+
+  wrapRef e = return e
+
+  go entryPointGuard binds = undefined
 
     where
     rw :: (Expr -> Expr) -> Bind -> Bind
@@ -137,9 +228,6 @@ rewrite binds = do
     rewriteMatchGroup f mg@GHC.MG {GHC.mg_alts = alts} = mg {GHC.mg_alts = (fmap . fmap . fmap) (rw' f) alts}
     rewriteMatchGroup _ _                              = unsupportedExtensionOf "MatchGroup"
 
-    notInUse = error "supposedly not in use after typechecking"
-    unsupportedExtensionOf = error . ("unsupported extension of " ++)
-
     rewriteExitPoints :: Expr -> Expr
     rewriteExitPoints e =
       case e of
@@ -164,7 +252,7 @@ rewrite binds = do
         (GHC.ExplicitSum    _ _ _ _)        -> e
         (GHC.HsCase         x e mg)         -> GHC.HsCase x e (rewriteMatchGroup rewriteExitPoints mg)
         (GHC.HsIf           x cond p th el) -> GHC.HsIf x cond p (rewriteExitPoints <$> th) (rewriteExitPoints <$> el)
-        (GHC.HsMultiIf      x rhss)         -> GHC.HsMultiIf x ((fmap . fmap . fmap) rw'' $ rhss)
+        (GHC.HsMultiIf      x rhss)         -> undefined -- GHC.HsMultiIf x ((fmap . fmap . fmap) rw'' $ rhss)
         (GHC.HsLet          x b e)          -> GHC.HsLet x b $ rewriteExitPoints <$> e
         (GHC.HsDo           x n stmts)      -> error "todo, involves statements"
         (GHC.ExplicitList   x _ _)          -> error "todo"
