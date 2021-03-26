@@ -23,12 +23,13 @@ import qualified Desugar    as GHC
 import qualified GHC
 
 -- syb
--- syb
 import Data.Generics (everywhereM, listify, mkM)
 -- template-haskell
 import qualified Language.Haskell.TH as TH
 -- debug
 import Debug.Trace (trace)
+-- transformers
+import Control.Monad.Trans.State.Strict
 
 plugin :: GHC.Plugin
 plugin =  GHC.defaultPlugin { GHC.typeCheckResultAction = const install {- this is to get rid of CLI options -}
@@ -112,7 +113,6 @@ rewrite :: GHC.LHsBinds GHC.GhcTc -> GHC.TcM (GHC.LHsBinds GHC.GhcTc)
 rewrite binds = do
   entry <- tc GHC.boolTy entryExpr
   let ep_guard = GHC.BodyStmt (error "element type of the rhs") entry (error "should be ?") (error "should be noSyntaxExpr")
-  -- return $ go (GHC.L GHC.noSrcSpan ep_guard) binds
   rewriteIdRefs
 
   where
@@ -191,99 +191,3 @@ rewrite binds = do
     GHC.zonkTopLExpr final_expr
 
   wrapRef e = return e
-
-  go entryPointGuard binds = undefined
-
-    where
-    rw :: (Expr -> Expr) -> Bind -> Bind
-    rw f bind@ GHC.FunBind {GHC.fun_matches = mg} | trace "FunBind" True =
-      bind {GHC.fun_matches = rewriteMatchGroup f mg}
-    rw f bind@ GHC.PatBind {GHC.pat_rhs = rhss} | trace "PatBind" True =
-      bind {GHC.pat_rhs = rw'' f rhss}
-    rw f bind@ GHC.AbsBinds {GHC.abs_binds = binds} =
-      bind {GHC.abs_binds = (fmap . fmap $ rw f) binds}
-    rw f x | trace ("Bind else:\n" ++ (indentWithRangle . GHC.showSDocUnsafe . GHC.ppr $ x)) True =
-      trace ("tru bind:" ++ name) x
-      where name = case x of
-                    GHC.XHsBindsLR {} -> "XHsBindsLR"
-                    GHC.PatSynBind {} -> "PatSynBind"
-                    GHC.VarBind    {} -> "VarBind"
-
-    rw' :: (Expr -> Expr) -> Match -> Match
-    rw' f m@ GHC.Match {GHC.m_grhss = rhs} | trace "Match" True =
-      m {GHC.m_grhss = rw'' f rhs}
-    rw' f x = x
-
-    rw'' :: (Expr -> Expr) -> RHSs -> RHSs
-    rw'' f rhss@ GHC.GRHSs {GHC.grhssGRHSs = guarded} | trace "RHSs" True =
-      rhss {GHC.grhssGRHSs = (fmap . fmap) (rw''' f) guarded}
-    rw'' f x = x
-
-    rw''' :: (Expr -> Expr) -> RHS -> RHS
-    rw''' f (GHC.GRHS x guards body) | trace "RHS" True =
-      GHC.GRHS x (entryPointGuard : guards) (f <$> body)
-    rw''' f x = x
-
-    rewriteMatchGroup :: (Expr -> Expr) -> MatchGroup -> MatchGroup
-    rewriteMatchGroup f mg@GHC.MG {GHC.mg_alts = alts} = mg {GHC.mg_alts = (fmap . fmap . fmap) (rw' f) alts}
-    rewriteMatchGroup _ _                              = unsupportedExtensionOf "MatchGroup"
-
-    rewriteExitPoints :: Expr -> Expr
-    rewriteExitPoints e =
-      case e of
-        GHC.HsVar           {}              -> wrapExitPoint e
-        GHC.HsUnboundVar    {}              -> e -- will not compile with holes
-        (GHC.HsConLikeOut   _ _)            -> error "todo" -- not sure about this one
-        GHC.HsRecFld        {}              -> wrapExitPoint e
-        GHC.HsOverLabel     {}              -> notInUse
-        GHC.HsIPVar         {}              -> notInUse
-        GHC.HsOverLit       {}              -> wrapExitPoint e
-        GHC.HsLit           {}              -> wrapExitPoint e
-        (GHC.HsLam          x mg)           -> GHC.HsLam     x $ rewriteMatchGroup rewriteExitPoints mg
-        (GHC.HsLamCase      x mg)           -> GHC.HsLamCase x $ rewriteMatchGroup rewriteExitPoints mg
-        (GHC.HsApp          x f a)          -> GHC.HsApp     x f $ rewriteExitPoints <$> a
-        (GHC.HsAppType      x e wc)         -> GHC.HsAppType x (rewriteExitPoints <$> e) wc -- not sure about this one either
-        (GHC.OpApp          x l o r)        -> GHC.OpApp     x l o $ rewriteExitPoints <$> r
-        (GHC.NegApp         x e n)          -> GHC.NegApp    x (rewriteExitPoints <$> e) n
-        (GHC.HsPar          x e)            -> GHC.HsPar     x $ rewriteExitPoints <$> e
-        (GHC.SectionL       x e o)          -> GHC.SectionL  x (rewriteExitPoints <$> e) o
-        (GHC.SectionR       x o e)          -> GHC.SectionR  x o $ rewriteExitPoints <$> e
-        (GHC.ExplicitTuple  _ _ _)          -> e
-        (GHC.ExplicitSum    _ _ _ _)        -> e
-        (GHC.HsCase         x e mg)         -> GHC.HsCase x e (rewriteMatchGroup rewriteExitPoints mg)
-        (GHC.HsIf           x cond p th el) -> GHC.HsIf x cond p (rewriteExitPoints <$> th) (rewriteExitPoints <$> el)
-        (GHC.HsMultiIf      x rhss)         -> undefined -- GHC.HsMultiIf x ((fmap . fmap . fmap) rw'' $ rhss)
-        (GHC.HsLet          x b e)          -> GHC.HsLet x b $ rewriteExitPoints <$> e
-        (GHC.HsDo           x n stmts)      -> error "todo, involves statements"
-        (GHC.ExplicitList   x _ _)          -> error "todo"
-          -- how do we actually deal with laziness? push traces to the leaves? the trouble is that the list is lazy,
-          -- so until (some of) its elements are evaluated, we have no clue as to whether the arguments in scope were
-          -- required or not. There also is no order to these evaluations.
-        (GHC.RecordCon      _ _ _)          -> e
-        (GHC.RecordUpd      _ _ _)          -> e
-        (GHC.ExprWithTySig  _ _ _)          -> e
-        (GHC.ArithSeq       _ _ _)          -> e
-        (GHC.HsSCC          _ _ _ _)        -> e
-        (GHC.HsCoreAnn      _ _ _ _)        -> e
-        (GHC.HsBracket      _ _)            -> e
-        (GHC.HsRnBracketOut _ _ _)          -> e
-        (GHC.HsTcBracketOut _ _ _)          -> e
-        (GHC.HsSpliceE      _ _)            -> e
-        (GHC.HsProc         _ _ _)          -> e
-        (GHC.HsStatic       _ _)            -> e
-        (GHC.HsTick         _ _ _)          -> e
-        (GHC.HsBinTick      _ _ _ _)        -> e
-        (GHC.HsTickPragma   _ _ _ _ _)      -> e
-        (GHC.HsWrap         x w e)          -> GHC.HsWrap x w $ rewriteExitPoints e -- TC output only
-        (GHC.XExpr          _)              -> e
-
-    wrapExitPoint :: Expr -> Expr
-    wrapExitPoint = id
-
--- rewrite :: GHC.LHsBinds GHC.GhcTc -> GHC.TcM (GHC.LHsBinds GHC.GhcTc)
--- rewrite binds = do mkM rw `everywhereM` binds
---   where
---         rw :: Expr.LHsExpr GHC.GhcTc -> GHC.TcM (Expr.LHsExpr GHC.GhcTc)
---         rw (GHC.L srcSpan expr) = case expr of
---           Expr.HsApp xa e1 e2 -> undefined
---         rw x = return x

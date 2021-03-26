@@ -21,7 +21,7 @@ library
   -- other-extensions:
 
   -- Other library packages from which modules are imported.
-  build-depends:       base >=4.11 && < 5 , ghc , template-haskell , syb
+  build-depends:       base >=4.11 && < 5 , ghc , template-haskell , syb , transformers
   -- Directories containing source files.
   hs-source-dirs:      src
 
