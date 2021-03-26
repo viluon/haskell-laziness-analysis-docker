@@ -1,3 +1,5 @@
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TemplateHaskell #-}
 {- HLINT ignore "Use record patterns" -}
@@ -24,12 +26,17 @@ import qualified GHC
 
 -- syb
 import Data.Generics (everywhereM, listify, mkM)
+import Data.Generics.Basics (Typeable)
+import Data.Generics.Aliases (extM)
+
 -- template-haskell
 import qualified Language.Haskell.TH as TH
 -- debug
 import Debug.Trace (trace)
--- transformers
+-- mtl & transformers
+import Control.Monad.State.Class hiding (get, put)
 import Control.Monad.Trans.State.Strict
+import Control.Monad.Trans.Class
 
 plugin :: GHC.Plugin
 plugin =  GHC.defaultPlugin { GHC.typeCheckResultAction = const install {- this is to get rid of CLI options -}
@@ -108,6 +115,9 @@ tc ty expr = do
   -- typecheck
   typecheckExpr ty expr_rn
 
+data WrapperState = WS { ws_fun :: Maybe GHC.Name -- ^ the function we're inside of
+                       }
+
 -- TODO: use optics
 rewrite :: GHC.LHsBinds GHC.GhcTc -> GHC.TcM (GHC.LHsBinds GHC.GhcTc)
 rewrite binds = do
@@ -118,10 +128,12 @@ rewrite binds = do
   where
   -- goal: rewrite argument references to go through trace
   -- plan:
-  --   - capture all bindings
-  --   - rewrite refs
-  --   - add a global mutable map
-  --   - count function calls via the map
+  --   - [x] capture all bindings
+  --   - [x] rewrite refs
+  --   - [ ] propagate scope (! misleading, we care about the surrounding function name) to ref sites
+  --     - how do we do this?
+  --   - [ ] add a global mutable map
+  --   - [ ] count function calls via the map
 
   isMatch :: Match -> Bool
   isMatch GHC.Match {} = True
@@ -164,30 +176,52 @@ rewrite binds = do
       extractIds  GHC.XPat      {}                       = unsupportedExtensionOf "Pat"
 
   rewriteIdRefs :: GHC.TcM (GHC.LHsBinds GHC.GhcTc)
-  rewriteIdRefs = everywhereM (mkM wrapRef) binds
+  rewriteIdRefs = do
+    (binds, _) <- (`runStateT` WS {ws_fun = Nothing}) $ everywhereM trans binds
+    return binds
 
-  wrapRef :: LExpr -> GHC.TcM LExpr
+    where
+      -- the monadic transformation capturing function info and wrapping argument references
+      trans :: Typeable a => a -> StateT WrapperState GHC.TcM a
+      trans = mkM collectFunInfo `extM` wrapRef
+
+  collectFunInfo :: Bind -> StateT WrapperState GHC.TcM Bind
+  collectFunInfo bind
+                        = let name = case bind of
+                                    GHC.FunBind  {GHC.fun_id = lid} -> Right $ GHC.varName . GHC.unLoc $ lid
+                                    GHC.PatBind  {}                 -> Left  "pat bind"
+                                    GHC.VarBind  {GHC.var_id = vid} -> Right $ GHC.varName vid
+                                    GHC.AbsBinds {}                 -> Left  "abs bind"
+                                    _                               -> Left  . ("unsupported Bind extension:\n" ++) . GHC.showSDocUnsafe . GHC.ppr $ bind
+                        in case trace "------ collectFunInfo!" name of
+                            Right !nm -> put WS {ws_fun = Just nm} >>= (const . return $ bind)
+                            Left  msg -> return bind
+
+  wrapRef :: LExpr -> StateT WrapperState GHC.TcM LExpr
   wrapRef v@(GHC.L _ (GHC.HsVar x lid)) | GHC.unLoc lid `elem` boundVars = do
-    Right expr_ps <- fmap (GHC.convertToHsExpr GHC.Generated GHC.noSrcSpan)
-      $ GHC.liftIO
-      $ TH.runQ [| trace "hello world" |]
-    -- rename the TH source
-    (expr_rn, _ ) <- GHC.rnLExpr expr_ps
+      WS {ws_fun = Just funName} <- get
+      let traceStr = ("trace from " ++) . show . GHC.occNameFS . GHC.occName $ funName
 
-    -- obtain the type of the expression we're wrapping
-    Just (_, org_ty) <- toTyped v
+      Right expr_ps <- fmap (GHC.convertToHsExpr GHC.Generated GHC.noSrcSpan)
+        $ GHC.liftIO
+        $ TH.runQ [| trace traceStr |]
+      -- rename the TH source
+      (expr_rn, _ ) <- lift $ GHC.rnLExpr expr_ps
 
-    let ty = foldr1 (GHC.mkFunTy GHC.VisArg) [org_ty, org_ty]
+      -- obtain the type of the expression we're wrapping
+      Just (_, org_ty) <- lift $ toTyped v
 
-    -- Typecheck the new expression and capture generated constraints
-    (unwrapped_expr, wanteds) <-
-      GHC.captureConstraints (GHC.tcMonoExpr expr_rn (GHC.Check (trace (GHC.showSDocUnsafe (GHC.ppr ty)) ty)))
-    -- Create the wrapper
-    wrapper <- GHC.mkWpLet . GHC.EvBinds . GHC.evBindMapBinds . snd
-                <$> GHC.runTcS ( GHC.solveWanteds wanteds )
-    -- Apply the wrapper
-    let final_expr = GHC.mkHsApp (GHC.mkLHsWrap wrapper unwrapped_expr) v
-    -- Zonk to instantiate type variables
-    GHC.zonkTopLExpr final_expr
+      let ty = foldr1 (GHC.mkFunTy GHC.VisArg) [org_ty, org_ty]
+
+      -- Typecheck the new expression and capture generated constraints
+      (unwrapped_expr, wanteds) <- lift $
+        GHC.captureConstraints (GHC.tcMonoExpr expr_rn (GHC.Check (trace (GHC.showSDocUnsafe (GHC.ppr ty)) ty)))
+      -- Create the wrapper
+      wrapper <- lift $ GHC.mkWpLet . GHC.EvBinds . GHC.evBindMapBinds . snd
+                  <$> GHC.runTcS ( GHC.solveWanteds wanteds )
+      -- Apply the wrapper
+      let final_expr = GHC.mkHsApp (GHC.mkLHsWrap wrapper unwrapped_expr) v
+      -- Zonk to instantiate type variables
+      lift $ GHC.zonkTopLExpr (trace "------ wrapRef!" final_expr)
 
   wrapRef e = return e
