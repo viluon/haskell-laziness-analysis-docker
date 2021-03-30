@@ -1,7 +1,4 @@
-{-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE BangPatterns, RankNTypes, ScopedTypeVariables, LambdaCase, TemplateHaskell #-}
 {- HLINT ignore "Use record patterns" -}
 
 module RewritingPlugin (plugin) where
@@ -25,7 +22,8 @@ import qualified Desugar    as GHC
 import qualified GHC
 
 -- syb
-import Data.Generics (everywhereM, listify, mkM)
+-- syb
+import Data.Generics (everywhereM, listify, mkM, GenericM, everywhere', gmapM)
 import Data.Generics.Basics (Typeable)
 import Data.Generics.Aliases (extM)
 
@@ -118,6 +116,17 @@ tc ty expr = do
 data WrapperState = WS { ws_fun :: Maybe GHC.Name -- ^ the function we're inside of
                        }
 
+-- type GenericM m = forall a. Data a => a -> m a
+
+-- like everywhereM, but top-down
+everywhereM' :: forall m. Monad m => GenericM m -> GenericM m
+everywhereM' f = go
+  where
+    go :: GenericM m
+    go x = do
+      x' <- f x
+      gmapM go x'
+
 -- TODO: use optics
 rewrite :: GHC.LHsBinds GHC.GhcTc -> GHC.TcM (GHC.LHsBinds GHC.GhcTc)
 rewrite binds = do
@@ -177,7 +186,7 @@ rewrite binds = do
 
   rewriteIdRefs :: GHC.TcM (GHC.LHsBinds GHC.GhcTc)
   rewriteIdRefs = do
-    (binds, _) <- (`runStateT` WS {ws_fun = Nothing}) $ everywhereM trans binds
+    (binds, _) <- (`runStateT` WS {ws_fun = Nothing}) $ everywhereM' trans binds
     return binds
 
     where
@@ -186,21 +195,22 @@ rewrite binds = do
       trans = mkM collectFunInfo `extM` wrapRef
 
   collectFunInfo :: Bind -> StateT WrapperState GHC.TcM Bind
-  collectFunInfo bind
-                        = let name = case bind of
+  collectFunInfo bind = let name = case bind of
                                     GHC.FunBind  {GHC.fun_id = lid} -> Right $ GHC.varName . GHC.unLoc $ lid
                                     GHC.PatBind  {}                 -> Left  "pat bind"
                                     GHC.VarBind  {GHC.var_id = vid} -> Right $ GHC.varName vid
                                     GHC.AbsBinds {}                 -> Left  "abs bind"
                                     _                               -> Left  . ("unsupported Bind extension:\n" ++) . GHC.showSDocUnsafe . GHC.ppr $ bind
-                        in case trace "------ collectFunInfo!" name of
-                            Right !nm -> put WS {ws_fun = Just nm} >>= (const . return $ bind)
-                            Left  msg -> return bind
+                        in case trace "------ collectFunInfo! " name of
+                            Right !nm -> trace (indentWithRangle . show . GHC.occNameFS . GHC.occName $ nm)
+                                          put WS {ws_fun = Just nm} >>= (const . return $ bind)
+                            Left  msg -> trace ("  (" ++ msg ++ ")") $ return bind
 
   wrapRef :: LExpr -> StateT WrapperState GHC.TcM LExpr
-  wrapRef v@(GHC.L _ (GHC.HsVar x lid)) | GHC.unLoc lid `elem` boundVars = do
+  wrapRef (GHC.L span v@(GHC.HsVar x lid)) | GHC.unLoc lid `elem` boundVars && span /= GHC.noSrcSpan = do
       WS {ws_fun = Just funName} <- get
       let traceStr = ("trace from " ++) . show . GHC.occNameFS . GHC.occName $ funName
+      let varWithoutSrcSpan = GHC.L GHC.noSrcSpan v
 
       Right expr_ps <- fmap (GHC.convertToHsExpr GHC.Generated GHC.noSrcSpan)
         $ GHC.liftIO
@@ -209,7 +219,7 @@ rewrite binds = do
       (expr_rn, _ ) <- lift $ GHC.rnLExpr expr_ps
 
       -- obtain the type of the expression we're wrapping
-      Just (_, org_ty) <- lift $ toTyped v
+      Just (_, org_ty) <- lift $ toTyped varWithoutSrcSpan
 
       let ty = foldr1 (GHC.mkFunTy GHC.VisArg) [org_ty, org_ty]
 
@@ -220,7 +230,7 @@ rewrite binds = do
       wrapper <- lift $ GHC.mkWpLet . GHC.EvBinds . GHC.evBindMapBinds . snd
                   <$> GHC.runTcS ( GHC.solveWanteds wanteds )
       -- Apply the wrapper
-      let final_expr = GHC.mkHsApp (GHC.mkLHsWrap wrapper unwrapped_expr) v
+      let final_expr = GHC.mkHsApp (GHC.mkLHsWrap wrapper unwrapped_expr) varWithoutSrcSpan
       -- Zonk to instantiate type variables
       lift $ GHC.zonkTopLExpr (trace "------ wrapRef!" final_expr)
 
