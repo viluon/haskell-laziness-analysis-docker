@@ -1,7 +1,10 @@
 {-# LANGUAGE BangPatterns, RankNTypes, ScopedTypeVariables, LambdaCase, TemplateHaskell #-}
+{-# OPTIONS_GHC -Wincomplete-patterns -Wunused-binds -Wunused-matches #-}
 {- HLINT ignore "Use record patterns" -}
 
 module RewritingPlugin (plugin) where
+
+import System.IO.Unsafe (unsafePerformIO)
 
 -- ghc
 import qualified GhcPlugins as GHC
@@ -21,7 +24,12 @@ import qualified Desugar    as GHC
 
 import qualified GHC
 
--- syb
+-- ghc-heap-view
+import qualified GHC.HeapView as GHC
+
+-- time
+import Data.Time.Clock.System (getSystemTime, SystemTime(..))
+
 -- syb
 import Data.Generics (everywhereM, listify, mkM, GenericM, everywhere', gmapM)
 import Data.Generics.Basics (Typeable)
@@ -32,31 +40,20 @@ import qualified Language.Haskell.TH as TH
 -- debug
 import Debug.Trace (trace)
 -- mtl & transformers
-import Control.Monad.State.Class hiding (get, put)
-import Control.Monad.Trans.State.Strict
-import Control.Monad.Trans.Class
+import Control.Monad.State.Class ()
+import Control.Monad.Trans.State.Strict (StateT(runStateT), get, put)
+import Control.Monad.Trans.Class (MonadTrans(lift))
 
 plugin :: GHC.Plugin
 plugin =  GHC.defaultPlugin { GHC.typeCheckResultAction = const install {- this is to get rid of CLI options -}
                             }
-
-{-
-  Plan:
-  ====
-  - create custom tracing functions trace_n where n is the number of arguments
-  - apply trace_n to the arguments of the surrounding function at every exit point
-  - profit?
-
-  the question then is whether to keep trace_n in the plugin's source or conjure it up
-  in every module separately
-  ... and how to do either.
--}
 
 install :: GHC.ModSummary -> GHC.TcGblEnv -> GHC.TcM GHC.TcGblEnv
 install _ env | trace "●●● rewriting-plugin entry ●●●" True = do
   new_binds <- rewrite $ GHC.tcg_binds env
   GHC.liftIO . putStrLn . GHC.showSDocUnsafe . GHC.ppr $ new_binds
   return env {GHC.tcg_binds = new_binds}
+install _ _ = undefined
 
 
 type Bind  = GHC.HsBindLR GHC.GhcTc GHC.GhcTc
@@ -70,9 +67,6 @@ type Expr       = GHC.HsExpr     GHC.GhcTc
 
 entryExpr :: TH.ExpQ
 entryExpr = [| trace "rewriting-plugin says hello!" True |]
-
-exitExpr :: TH.ExpQ
-exitExpr = [| trace "exit point" |]
 
 -- | Check that an expression has the expected type.
 -- By Matthew Pickering as shown in plugin-constraint.
@@ -127,6 +121,31 @@ everywhereM' f = go
       x' <- f x
       gmapM go x'
 
+occNameStr :: GHC.HasOccName a => a -> String
+occNameStr = show . GHC.occNameFS . GHC.occName
+
+closureType c = case c of
+  GHC.ConstrClosure    {} -> "constr"
+  GHC.FunClosure       {} -> "fun"
+  GHC.ThunkClosure     {} -> "thunk"
+  GHC.SelectorClosure  {} -> "selector"
+  GHC.PAPClosure       {} -> "pap"
+  GHC.APClosure        {} -> "ap"
+  GHC.IndClosure       {} -> "ind"
+  GHC.BCOClosure       {} -> "bco"
+  GHC.BlackholeClosure {} -> "blackhole"
+  GHC.ArrWordsClosure  {} -> "bytearray#"
+  _                       -> "!unknown"
+
+traceArg :: String -> String -> a -> a
+traceArg funName arg x = unsafePerformIO $ do
+  let x' = GHC.asBox x
+  closure <- GHC.getBoxedClosureData x'
+  MkSystemTime {systemNanoseconds = time} <- getSystemTime
+
+  appendFile "/tmp/trace.csv" $ (++ "\n") $ concatMap (++ ",") [show time, funName, arg, closureType closure]
+  return x
+
 -- TODO: use optics
 rewrite :: GHC.LHsBinds GHC.GhcTc -> GHC.TcM (GHC.LHsBinds GHC.GhcTc)
 rewrite binds = do
@@ -139,8 +158,9 @@ rewrite binds = do
   -- plan:
   --   - [x] capture all bindings
   --   - [x] rewrite refs
-  --   - [ ] propagate scope (! misleading, we care about the surrounding function name) to ref sites
+  --   - [x] propagate scope (! misleading, we care about the surrounding function name) to ref sites
   --     - how do we do this?
+  --   - [x] use ghc-heap-view to peek inside the arguments
   --   - [ ] add a global mutable map
   --   - [ ] count function calls via the map
 
@@ -207,14 +227,18 @@ rewrite binds = do
                             Left  msg -> trace ("  (" ++ msg ++ ")") $ return bind
 
   wrapRef :: LExpr -> StateT WrapperState GHC.TcM LExpr
-  wrapRef (GHC.L span v@(GHC.HsVar x lid)) | GHC.unLoc lid `elem` boundVars && span /= GHC.noSrcSpan = do
+  wrapRef (GHC.L span v@(GHC.HsVar x lid))
+    -- make sure the Id is bound by some pattern and it's not a part of an already rewritten expression
+    | GHC.unLoc lid `elem` boundVars && span /= GHC.noSrcSpan = do
       WS {ws_fun = Just funName} <- get
-      let traceStr = ("trace from " ++) . show . GHC.occNameFS . GHC.occName $ funName
+
+      let argName = occNameStr . GHC.varName . GHC.unLoc $ lid
       let varWithoutSrcSpan = GHC.L GHC.noSrcSpan v
+      let funName' = occNameStr funName
 
       Right expr_ps <- fmap (GHC.convertToHsExpr GHC.Generated GHC.noSrcSpan)
         $ GHC.liftIO
-        $ TH.runQ [| trace traceStr |]
+        $ TH.runQ [| traceArg funName' argName |]
       -- rename the TH source
       (expr_rn, _ ) <- lift $ GHC.rnLExpr expr_ps
 
@@ -228,7 +252,7 @@ rewrite binds = do
         GHC.captureConstraints (GHC.tcMonoExpr expr_rn (GHC.Check (trace (GHC.showSDocUnsafe (GHC.ppr ty)) ty)))
       -- Create the wrapper
       wrapper <- lift $ GHC.mkWpLet . GHC.EvBinds . GHC.evBindMapBinds . snd
-                  <$> GHC.runTcS ( GHC.solveWanteds wanteds )
+                  <$> GHC.runTcS (GHC.solveWanteds wanteds)
       -- Apply the wrapper
       let final_expr = GHC.mkHsApp (GHC.mkLHsWrap wrapper unwrapped_expr) varWithoutSrcSpan
       -- Zonk to instantiate type variables
