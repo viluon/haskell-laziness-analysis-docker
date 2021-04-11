@@ -1,9 +1,8 @@
-{-# LANGUAGE BangPatterns, RankNTypes, ScopedTypeVariables, LambdaCase, TemplateHaskell #-}
-{-# OPTIONS_GHC -Wincomplete-patterns -Wunused-binds -Wunused-matches #-}
+{-# LANGUAGE BangPatterns, RankNTypes, ScopedTypeVariables, LambdaCase, TemplateHaskell, StandaloneDeriving, FlexibleInstances #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
+{-# OPTIONS_GHC -Wincomplete-patterns -Wunused-binds -Wunused-matches -ferror-spans -freverse-errors -fprint-expanded-synonyms #-}
 {- HLINT ignore "Use record patterns" -}
 
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE FlexibleInstances #-}
 module RewritingPlugin (plugin) where
 
 import System.IO.Unsafe (unsafePerformIO)
@@ -34,9 +33,10 @@ import qualified GHC.HeapView as GHC
 import Data.Time.Clock.System (getSystemTime, SystemTime(..))
 
 -- syb
-import Data.Generics (everywhereM, listify, mkM, GenericM, everywhere', gmapM)
-import Data.Generics.Basics (Typeable)
+import Data.Generics (everywhereM, listify, mkM, mkT, GenericM, everywhere', gmapM, everywhere)
+import Data.Generics.Basics (Typeable, Data)
 import Data.Generics.Aliases (extM)
+import Data.Generics.Text (gshow)
 
 -- template-haskell
 import qualified Language.Haskell.TH as TH
@@ -46,8 +46,7 @@ import Debug.Trace (trace)
 import Control.Monad.State.Class ()
 import Control.Monad.Trans.State.Strict (StateT(runStateT), get, put)
 import Control.Monad.Trans.Class (MonadTrans(lift))
--- containers
-import qualified Data.HashSet as S
+
 
 plugin :: GHC.Plugin
 plugin =  GHC.defaultPlugin { GHC.typeCheckResultAction = const install {- this is to get rid of CLI options -}
@@ -111,7 +110,6 @@ tc ty expr = do
 
 data WrapperState = WS { ws_fun         :: Maybe GHC.Name     -- ^ the function we're inside of
                        , ws_callCounter :: Maybe GHC.Id       -- ^ the reference to the Int denoting the number of the current function call
-                       , ws_processed   :: !(S.HashSet LExpr) -- ^ the set of already processed expressions
                        }
 
 -- type GenericM m = forall a. Data a => a -> m a
@@ -152,8 +150,11 @@ logt sort params = do
     . ([show time, show sort] ++)
     $ params
 
-traceEntry :: a -> a
-traceEntry = id
+traceEntry :: () -> Int
+traceEntry () = unsafePerformIO $ do
+  logt EntryTrace
+    []
+  return 1
 
 traceArg :: String -> String -> Int -> a -> a
 traceArg funName arg callNumber x = unsafePerformIO $ do
@@ -181,50 +182,51 @@ collectFunInfo bind =
         GHC.AbsBinds {} -> Left  "abs bind"
         _               -> Left  . ("unsupported Bind extension:\n" ++) . GHC.showSDocUnsafe . GHC.ppr $ bind
   in case trace "------ collectFunInfo! " name of
-    Right !nm -> trace (indentWithRangle . show . GHC.occNameFS . GHC.occName $ nm) $
-                  do
-                    state <- get
-                    put state {ws_fun = Just nm}
-                    return bind
-    Left  msg -> trace ("  (" ++ msg ++ ")") $ return bind
+    -- FIXME ugliness
+    Right !nm | "call_number" /= (read . show . GHC.occNameFS . GHC.occName $ nm) ->
+      trace (indentWithRangle . show . GHC.occNameFS . GHC.occName $ nm) $
+        do
+          state <- get
+          put state {ws_fun = Just nm}
+          return bind
+    Left msg -> trace ("  (" ++ msg ++ ")") $ return bind
+    _        -> trace "hit a call_number"   $ return bind
 
-incrementCallCounter :: LExpr -> StateT WrapperState GHC.TcM LExpr
-incrementCallCounter lexpr@(GHC.L span expr)
+incrementCallCounter :: RHS -> StateT WrapperState GHC.TcM RHS
+incrementCallCounter (GHC.GRHS x guards lexpr@(GHC.L span _))
   | {- TODO: come up with a more robust solution -} span /= GHC.noSrcSpan = do
-  counterName <- lift $ GHC.newName $ GHC.mkOccName GHC.dataName "call-counter"
-  let counterId = GHC.mkLocalId counterName GHC.intTy
+  -- counterName <- lift $ GHC.newName $ GHC.mkOccName GHC.dataName "call-counter"
+  -- let counterId = GHC.mkLocalId counterName GHC.intTy
 
-  -- let matchGroup :: MatchGroup = GHC.MG
-  --       { GHC.mg_ext    = GHC.MatchGroupTc
-  --                         { GHC.mg_arg_tys = error "to-do" -- :: [Type]  Types of the arguments, t1..tn
-  --                         , GHC.mg_res_ty  = error "to-do" -- :: Type    Type of the result, tr
-  --                         }
-  --       , GHC.mg_alts   = error "to-do" -- :: Located [LMatch GhcTc LExpr]
-  --       , GHC.mg_origin = GHC.Generated
-  --       }
+  GHC.liftIO . putStrLn . GHC.showSDocUnsafe . trace "this is the captain speaking" $ GHC.ppr lexpr
 
-  let nef = GHC.NoExtField
+  -- build the let expression for the call_number variable
+  let (~>) = GHC.mkVisFunTy
+  Just (_, org_ty) <- lift $ toTyped lexpr
+  letExpr <- lift $
+    tc (org_ty ~> org_ty) [| \x -> let call_number = traceEntry () in x |]
 
-  let matchGroup = GHC.MG
-        { GHC.mg_ext    = GHC.NoExtField
-        , GHC.mg_alts   = error "to-do"
-        , GHC.mg_origin = GHC.Generated
-        }
+  -- extract the call_number Id
+  let GHC.L _ (GHC.HsLam _ (GHC.MG _ (GHC.L _ ((GHC.L _ (GHC.Match _ _ ((GHC.L _ (GHC.VarPat _ (GHC.L _ var))):_) _)):_)) _)) = letExpr
 
-  let actualBind :: GHC.HsBindLR GHC.GhcRn GHC.GhcRn = GHC.FunBind
-        { GHC.fun_ext     = GHC.emptyNameSet -- locally-bound free variables of this definition
-        , GHC.fun_id      = error "to-do"
-        , GHC.fun_matches = matchGroup
-        , GHC.fun_co_fn   = GHC.WpHole       -- identity coercion
-        , GHC.fun_tick    = []               -- ticks to put on the rhs
-        }
+  -- update state
+  state <- get
+  put state {ws_callCounter = Just var}
 
-  let binds = GHC.HsValBinds nef (GHC.ValBinds nef (GHC.unitBag (GHC.L GHC.noSrcSpan actualBind)) [])
-  let letExpr = GHC.HsLet nef (GHC.L GHC.noSrcSpan binds) lexpr
-  -- TODO update state
-  return $ GHC.L GHC.noSrcSpan letExpr
+  -- apply the λ-wrapped let binder to the original expression
+  !completeExpr <- lift . GHC.zonkTopLExpr $ GHC.mkHsApp letExpr (everywhere (mkT removeSrcSpans) lexpr)
+
+  GHC.liftIO . putStrLn . GHC.showSDocUnsafe . trace "please remain calm" $ GHC.ppr completeExpr
+  return $ {- trace (gshow expr) $ -} GHC.GRHS x guards (trace "ok?" completeExpr)
+
+  where
+    removeSrcSpans :: GenLocSpan LExpr -> GenLocSpan LExpr
+    removeSrcSpans (GHC.L _ x) = GHC.L GHC.noSrcSpan x
 
 incrementCallCounter x = return x
+
+
+type GenLocSpan = GHC.GenLocated GHC.SrcSpan
 
 -- goal: rewrite argument references to go through trace
 -- plan:
@@ -240,7 +242,7 @@ rewrite :: GHC.LHsBinds GHC.GhcTc -> GHC.TcM (GHC.LHsBinds GHC.GhcTc)
 rewrite binds = fst <$> (`runStateT` initialState) (everywhereM' trans binds)
   where
 
-  initialState = WS {ws_fun = Nothing, ws_callCounter = Nothing, ws_processed = S.empty}
+  initialState = WS {ws_fun = Nothing, ws_callCounter = Nothing}
 
   -- the monadic transformation capturing function info, introducing call number variables, and wrapping argument references
   trans :: Typeable a => a -> StateT WrapperState GHC.TcM a
@@ -290,26 +292,33 @@ rewrite binds = fst <$> (`runStateT` initialState) (everywhereM' trans binds)
          , ws_callCounter = Just callCounter
          } <- get
 
+      GHC.liftIO . putStrLn . GHC.showSDocUnsafe . trace "umm what??" $ GHC.ppr v
+
       let argName = occNameStr . GHC.varName . GHC.unLoc $ lid
       let varWithoutSrcSpan = GHC.L GHC.noSrcSpan v
       let funName' = occNameStr funName
 
-      Right expr_ps <- fmap (GHC.convertToHsExpr GHC.Generated GHC.noSrcSpan)
+      GHC.liftIO . putStrLn . indentWithRangle $ "TH time"
+      Right !expr_ps <- fmap (GHC.convertToHsExpr GHC.Generated GHC.noSrcSpan)
         $ GHC.liftIO
         $ TH.runQ [| traceArg funName' argName |]
       -- rename the TH source
-      (expr_rn, _ ) <- lift $ GHC.rnLExpr expr_ps
+      GHC.liftIO . putStrLn . indentWithRangle $ "rn time"
+      (!expr_rn, _ ) <- lift $ GHC.rnLExpr expr_ps
 
       -- obtain the type of the expression we're wrapping
-      Just (_, org_ty) <- lift $ toTyped varWithoutSrcSpan
+      GHC.liftIO . putStrLn . indentWithRangle $ "type time"
+      Just (_, !org_ty) <- lift $ toTyped varWithoutSrcSpan
 
       let ty = foldr1 (GHC.mkFunTy GHC.VisArg) [org_ty, org_ty]
 
       -- Typecheck the new expression and capture generated constraints
-      (unwrapped_expr, wanteds) <- lift $
+      GHC.liftIO . putStrLn . indentWithRangle $ "tc time"
+      (!unwrapped_expr, wanteds) <- lift $
         GHC.captureConstraints (GHC.tcMonoExpr expr_rn (GHC.Check ty))
       -- Create the wrapper
-      wrapper <- lift $ GHC.mkWpLet . GHC.EvBinds . GHC.evBindMapBinds . snd
+      GHC.liftIO . putStrLn . indentWithRangle $ "wrapper time"
+      !wrapper <- lift $ GHC.mkWpLet . GHC.EvBinds . GHC.evBindMapBinds . snd
                   <$> GHC.runTcS (GHC.solveWanteds wanteds)
       -- Apply the wrapper
       -- GHC.mkHsLam (pats :: [LPat]) (body :: LHsExpr)
@@ -317,9 +326,13 @@ rewrite binds = fst <$> (`runStateT` initialState) (everywhereM' trans binds)
 
       let counter :: LExpr = GHC.L GHC.noSrcSpan $ GHC.HsVar GHC.NoExtField $ GHC.L GHC.noSrcSpan callCounter
 
-      let final_expr = GHC.mkHsApp
+      let !final_expr = GHC.mkHsApp
             (GHC.mkHsApp (GHC.mkLHsWrap wrapper unwrapped_expr) varWithoutSrcSpan) counter
       -- Zonk to instantiate type variables
+      GHC.liftIO . putStrLn . indentWithRangle $ "zonk time"
+      GHC.liftIO . putStrLn . indentWithRangle . GHC.showSDocUnsafe . GHC.ppr $ final_expr
       lift $ GHC.zonkTopLExpr (trace "------ wrapRef!" final_expr)
 
   wrapRef e = return e
+
+-- 💡 the test for what's wrong is ~easy: if we don't include a call_number ref, does it work?
