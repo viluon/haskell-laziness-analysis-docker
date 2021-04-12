@@ -29,6 +29,7 @@ library
                      , transformers
                      , ghc-heap-view
                      , time
+                     , containers
   -- Directories containing source files.
   hs-source-dirs:      src
 

@@ -1,11 +1,19 @@
 {-# LANGUAGE BangPatterns, RankNTypes, ScopedTypeVariables, LambdaCase, TemplateHaskell, StandaloneDeriving, FlexibleInstances #-}
-{-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE AllowAmbiguousTypes, TupleSections #-}
 {-# OPTIONS_GHC -Wincomplete-patterns -Wunused-binds -Wunused-matches -ferror-spans -freverse-errors -fprint-expanded-synonyms #-}
 {- HLINT ignore "Use record patterns" -}
 
 module RewritingPlugin (plugin) where
 
+-- unsafe features
 import System.IO.Unsafe (unsafePerformIO)
+
+-- IO
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import System.IO
+
+-- concurrency
+import Control.Concurrent (myThreadId)
 
 -- ghc
 import qualified GhcPlugins as GHC
@@ -37,14 +45,20 @@ import Data.Generics.Schemes (everywhere, listify, something)
 import Data.Generics.Basics  (Data(gmapM), Typeable)
 import Data.Generics.Aliases (extM, extT, mkM, mkQ, mkT, GenericM)
 import Data.Generics.Text    (gshow)
+
 -- template-haskell
 import qualified Language.Haskell.TH as TH
+
 -- debug
 import Debug.Trace (trace)
+
 -- mtl & transformers
 import Control.Monad.Trans.State.Strict (StateT(runStateT), get, put)
 import Control.Monad.Trans.Class (MonadTrans(lift))
 import Control.Monad.State.Class ()
+
+-- containers
+import qualified Data.Map.Strict as M
 
 
 plugin :: GHC.Plugin
@@ -111,8 +125,6 @@ data WrapperState = WS { ws_fun         :: Maybe GHC.Name     -- ^ the function 
                        , ws_callCounter :: Maybe GHC.Id       -- ^ the reference to the Int denoting the number of the current function call
                        }
 
--- type GenericM m = forall a. Data a => a -> m a
-
 -- like everywhereM, but top-down
 everywhereM' :: forall m. Monad m => GenericM m -> GenericM m
 everywhereM' f = go
@@ -123,7 +135,7 @@ everywhereM' f = go
       gmapM go x'
 
 occNameStr :: GHC.HasOccName a => a -> String
-occNameStr = show . GHC.occNameFS . GHC.occName
+occNameStr = read . show . GHC.occNameFS . GHC.occName
 
 closureType c = case c of
   GHC.ConstrClosure    {} -> "constr"
@@ -140,20 +152,41 @@ closureType c = case c of
 
 data TraceSort = ArgTrace | EntryTrace deriving (Eq, Show)
 
+{-# NOINLINE outputHandle #-}
+outputHandle :: IORef Handle
+outputHandle = unsafePerformIO $ do
+  -- TODO set the path with a CLI argument if possible
+  handle <- openFile "/tmp/trace.csv" AppendMode
+  newIORef handle
+
 logt :: TraceSort -> [String] -> IO ()
 logt sort params = do
   MkSystemTime {systemNanoseconds = time} <- getSystemTime
-  appendFile "/tmp/trace.csv"
+  threadId <- myThreadId
+  handle <- readIORef outputHandle
+
+  hPutStr handle
     . (++ "\n")
     . concatMap (++ ",")
-    . ([show time, show sort] ++)
+    . ([show time, show threadId, show sort] ++)
     $ params
+  hFlush handle
 
-traceEntry :: () -> Int
-traceEntry () = unsafePerformIO $ do
+{-# NOINLINE functionEntries #-}
+functionEntries :: IORef (M.Map String Int)
+functionEntries = unsafePerformIO $ newIORef M.empty
+
+traceEntry :: String -> Int
+traceEntry funName = unsafePerformIO $ do
+  atomicModifyIORef' functionEntries ((, ()) . M.insertWith (+) funName 1)
+  entries <- readIORef functionEntries
+  let callNumber = entries M.! funName
+
   logt EntryTrace
-    []
-  return 1
+    [ funName
+    , show callNumber
+    ]
+  return callNumber
 
 traceArg :: String -> String -> Int -> a -> a
 traceArg funName arg callNumber x = unsafePerformIO $ do
@@ -186,8 +219,8 @@ collectFunInfo bind =
         _               -> Left  . ("unsupported Bind extension:\n" ++) . GHC.showSDocUnsafe . GHC.ppr $ bind
   in case trace "------ collectFunInfo! " name of
     -- FIXME ugliness
-    Right !nm | "call_number" /= (read . show . GHC.occNameFS . GHC.occName $ nm) ->
-      trace (indentWithRangle . show . GHC.occNameFS . GHC.occName $ nm) $
+    Right !nm | "call_number" /= occNameStr nm ->
+      trace (indentWithRangle . occNameStr $ nm) $
         do
           state <- get
           put state {ws_fun = Just nm}
@@ -199,16 +232,19 @@ dummyBinding :: a
 dummyBinding = undefined
 
 incrementCallCounter :: RHS -> StateT WrapperState GHC.TcM RHS
-incrementCallCounter (GHC.GRHS x guards lexpr@(GHC.L span expr))
+incrementCallCounter (GHC.GRHS x guards lexpr@(GHC.L span _))
   | {- TODO: come up with a more robust solution -} span /= GHC.noSrcSpan = do
+  WS {ws_fun = Just funName} <- get
+  let funName' = occNameStr funName
   -- build the let expression for the call_number variable
   Just (_, org_ty) <- lift $ toTyped lexpr
-  letExpr <- lift $
-    tc org_ty [| let call_number = traceEntry () in dummyBinding |]
+  letExpr <- lift $ tc org_ty [| let !call_number = traceEntry funName' in dummyBinding |]
+
+  -- up next: rename the ExpQ rather than typechecking it right away (do the substitution on the rn thing, then tc)
 
   -- extract the call_number Id
   let Just !var = (something $ mkQ Nothing (\case
-        x | "call_number" == (read . show . GHC.occNameFS . GHC.occName $ x) -> Just x
+        x | "call_number" == occNameStr x -> Just x
         _ -> Nothing
         )) letExpr
 
@@ -217,8 +253,7 @@ incrementCallCounter (GHC.GRHS x guards lexpr@(GHC.L span expr))
   put state {ws_callCounter = Just var}
 
   -- apply the λ-wrapped let binder to the original expression
-  !completeExpr <- lift . GHC.zonkTopLExpr $
-    everywhere (mkT removeSrcSpans `extT` replaceUndefinedWith expr) letExpr
+  !completeExpr <- lift . GHC.zonkTopLExpr $ everywhere (mkT removeSrcSpans `extT` replaceDummyWith lexpr) letExpr
 
   GHC.liftIO . putStrLn . GHC.showSDocUnsafe $ GHC.ppr completeExpr
   return $ GHC.GRHS x guards completeExpr
@@ -227,11 +262,11 @@ incrementCallCounter (GHC.GRHS x guards lexpr@(GHC.L span expr))
     removeSrcSpans :: GenLocSpan LExpr -> GenLocSpan LExpr
     removeSrcSpans (GHC.L _ x) = GHC.L GHC.noSrcSpan x
 
-    replaceUndefinedWith :: Expr -> Expr -> Expr
-    replaceUndefinedWith replacement = \case
-      (GHC.HsVar _ (GHC.L _ x)) | "dummyBinding" == (read . show . GHC.occNameFS . GHC.occName $ x) -> replacement
-      x | trace ("did not match: " ++ GHC.showSDocUnsafe (GHC.ppr x) ++ "\n" ++ indentWithRangle (gshow x)) True -> x
-      _ -> undefined
+    replaceDummyWith :: LExpr -> LExpr -> LExpr
+    replaceDummyWith replacement = \case
+      (GHC.L _ (GHC.HsWrap _ _ (GHC.HsVar _ (GHC.L _ x))))
+        | "dummyBinding" == occNameStr x -> replacement
+      x -> x
 
 incrementCallCounter x = return x
 
@@ -245,8 +280,8 @@ type GenLocSpan = GHC.GenLocated GHC.SrcSpan
 --   - [x] propagate scope (! misleading, we care about the surrounding function name) to ref sites
 --     - how do we do this?
 --   - [x] use ghc-heap-view to peek inside the arguments
---   - [ ] add a global mutable map
---   - [ ] count function calls via the map
+--   - [x] add a global mutable map
+--   - [x] count function calls via the map
 
 rewrite :: GHC.LHsBinds GHC.GhcTc -> GHC.TcM (GHC.LHsBinds GHC.GhcTc)
 rewrite binds = fst <$> (`runStateT` initialState) (everywhereM' trans binds)
