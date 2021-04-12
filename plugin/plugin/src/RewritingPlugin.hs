@@ -33,19 +33,18 @@ import qualified GHC.HeapView as GHC
 import Data.Time.Clock.System (getSystemTime, SystemTime(..))
 
 -- syb
-import Data.Generics (everywhereM, listify, mkM, mkT, mkQ, GenericM, GenericQ, everywhere', gmapM, everywhere, something)
-import Data.Generics.Basics (Typeable, Data)
-import Data.Generics.Aliases (extM)
-import Data.Generics.Text (gshow)
-
+import Data.Generics.Schemes (everywhere, listify, something)
+import Data.Generics.Basics  (Data(gmapM), Typeable)
+import Data.Generics.Aliases (extM, extT, mkM, mkQ, mkT, GenericM)
+import Data.Generics.Text    (gshow)
 -- template-haskell
 import qualified Language.Haskell.TH as TH
 -- debug
 import Debug.Trace (trace)
 -- mtl & transformers
-import Control.Monad.State.Class ()
 import Control.Monad.Trans.State.Strict (StateT(runStateT), get, put)
 import Control.Monad.Trans.Class (MonadTrans(lift))
+import Control.Monad.State.Class ()
 
 
 plugin :: GHC.Plugin
@@ -196,13 +195,16 @@ collectFunInfo bind =
     Left msg -> trace ("  (" ++ msg ++ ")") $ return bind
     _        -> trace "hit a call_number"   $ return bind
 
+dummyBinding :: a
+dummyBinding = undefined
+
 incrementCallCounter :: RHS -> StateT WrapperState GHC.TcM RHS
-incrementCallCounter (GHC.GRHS x guards lexpr@(GHC.L span _))
+incrementCallCounter (GHC.GRHS x guards lexpr@(GHC.L span expr))
   | {- TODO: come up with a more robust solution -} span /= GHC.noSrcSpan = do
   -- build the let expression for the call_number variable
   Just (_, org_ty) <- lift $ toTyped lexpr
   letExpr <- lift $
-    tc (org_ty ~> org_ty) [| \x -> let call_number = traceEntry () in x |]
+    tc org_ty [| let call_number = traceEntry () in dummyBinding |]
 
   -- extract the call_number Id
   let Just !var = (something $ mkQ Nothing (\case
@@ -211,11 +213,12 @@ incrementCallCounter (GHC.GRHS x guards lexpr@(GHC.L span _))
         )) letExpr
 
   -- update state
-  state <- get
+  !state <- get
   put state {ws_callCounter = Just var}
 
   -- apply the λ-wrapped let binder to the original expression
-  !completeExpr <- lift . GHC.zonkTopLExpr $ GHC.mkHsApp letExpr (everywhere (mkT removeSrcSpans) lexpr)
+  !completeExpr <- lift . GHC.zonkTopLExpr $
+    everywhere (mkT removeSrcSpans `extT` replaceUndefinedWith expr) letExpr
 
   GHC.liftIO . putStrLn . GHC.showSDocUnsafe $ GHC.ppr completeExpr
   return $ GHC.GRHS x guards completeExpr
@@ -223,6 +226,12 @@ incrementCallCounter (GHC.GRHS x guards lexpr@(GHC.L span _))
   where
     removeSrcSpans :: GenLocSpan LExpr -> GenLocSpan LExpr
     removeSrcSpans (GHC.L _ x) = GHC.L GHC.noSrcSpan x
+
+    replaceUndefinedWith :: Expr -> Expr -> Expr
+    replaceUndefinedWith replacement = \case
+      (GHC.HsVar _ (GHC.L _ x)) | "dummyBinding" == (read . show . GHC.occNameFS . GHC.occName $ x) -> replacement
+      x | trace ("did not match: " ++ GHC.showSDocUnsafe (GHC.ppr x) ++ "\n" ++ indentWithRangle (gshow x)) True -> x
+      _ -> undefined
 
 incrementCallCounter x = return x
 
