@@ -76,6 +76,15 @@ closureType c = case c of
   GHC.ArrWordsClosure  {} -> "bytearray#"
   _                       -> "!unknown"
 
+{-
+
+foo x =
+  RHS <- replace x with (traceArg "foo" "x" call_number x)
+
+traceArg :: ... -> a -> IO a
+
+-}
+
 traceArg :: String -> String -> Int -> a -> a
 traceArg funName arg callNumber x = unsafePerformIO $ do
   let x' = GHC.asBox x

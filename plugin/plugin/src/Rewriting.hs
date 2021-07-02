@@ -30,8 +30,10 @@ import Control.Monad.State.Class ()
 import Debug.Trace (trace)
 
 
-data WrapperState = WS { ws_fun         :: Maybe GHC.Name     -- ^ the function we're inside of
-                       , ws_callCounter :: Maybe GHC.Id       -- ^ the reference to the Int denoting the number of the current function call
+data WrapperState = WS { ws_fun         :: Maybe GHC.Name
+                         -- ^ the function we're inside of
+                       , ws_callCounter :: Maybe GHC.Id
+                         -- ^ the reference to the Int denoting the number of the current function call
                        }
 
 -- like everywhereM, but top-down
@@ -54,8 +56,7 @@ collectFunInfo bind =
         GHC.VarBind  {} -> Right $ GHC.varName . GHC.var_id $ bind
         GHC.AbsBinds {} -> Left  "abs bind"
         _               -> Left  . ("unsupported Bind extension:\n" ++) . GHC.showSDocUnsafe . GHC.ppr $ bind
-  in case trace "------ collectFunInfo! " name of
-    -- FIXME ugliness
+  in case name of
     Right !nm | "call_number" /= occNameStr nm ->
       trace (indentWithRangle . occNameStr $ nm) $
         do
@@ -63,7 +64,7 @@ collectFunInfo bind =
           put state {ws_fun = Just nm}
           return bind
     Left msg -> trace ("  (" ++ msg ++ ")") $ return bind
-    _        -> trace "hit a call_number"   $ return bind
+    _        ->                               return bind
 
 dummyBinding :: a
 dummyBinding = undefined
@@ -75,7 +76,9 @@ incrementCallCounter (GHC.GRHS x guards lexpr@(GHC.L span _))
   let funName' = occNameStr funName
   -- build the let expression for the call_number variable
   Just (_, org_ty) <- lift $ toTyped lexpr
-  letExpr <- lift $ tc org_ty [| let !call_number = traceEntry funName' in dummyBinding |]
+  letExpr <- lift $ tc org_ty [|
+    let call_number = traceEntry funName' in call_number `seq` dummyBinding
+    |]
 
   -- extract the call_number Id
   let Just !var = (something $ mkQ Nothing (\case
@@ -115,7 +118,8 @@ rewrite binds = fst <$> (`runStateT` initialState) (everywhereM' trans binds)
 
   initialState = WS {ws_fun = Nothing, ws_callCounter = Nothing}
 
-  -- the monadic transformation capturing function info, introducing call number variables, and wrapping argument references
+  -- the monadic transformation capturing function info,
+  -- introducing call number variables, and wrapping argument references
   trans :: Typeable a => a -> StateT WrapperState GHC.TcM a
   trans = mkM collectFunInfo `extM` wrapRef `extM` incrementCallCounter
 
@@ -174,6 +178,6 @@ rewrite binds = fst <$> (`runStateT` initialState) (everywhereM' trans binds)
       let !final_expr = GHC.mkHsApp (GHC.mkHsApp pap counter) varWithoutSrcSpan
 
       -- Zonk to instantiate type variables
-      lift $ GHC.zonkTopLExpr (trace "------ wrapRef!" final_expr)
+      lift $ GHC.zonkTopLExpr final_expr
 
   wrapRef e = return e
