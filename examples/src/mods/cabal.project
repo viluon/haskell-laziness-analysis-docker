@@ -1,0 +1,3 @@
+packages:      using-modules/using-modules.cabal
+with-compiler: /home/viluon/Projects/haskell/lazy-analysis/container/ghc-8.10.2/_build/stage1/bin/ghc
+

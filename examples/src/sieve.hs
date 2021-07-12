@@ -8,5 +8,16 @@ primes = step 2 M.empty
           step (n+1) $ foldl' (\m v -> M.insertWith (++) (n+v) [v] m) m vs
         step p m = p : step p (M.insert p [p] m)
 
+{-
+
+SYB
+
+      λ n <-call_counter
+    /     \
+  (λ ...)  n <- traceArg "n" call_counter_1 n
+    ^ call_counter_1
+
+-}
+
 main :: IO ()
 main = print $ take 10 primes
