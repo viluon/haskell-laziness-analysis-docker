@@ -30,6 +30,7 @@ library
                      , ghc-heap-view
                      , time
                      , containers
+                     , syz
   -- Directories containing source files.
   hs-source-dirs:      src
 

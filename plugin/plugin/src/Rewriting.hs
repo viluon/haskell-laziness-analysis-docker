@@ -1,7 +1,12 @@
-{-# LANGUAGE BangPatterns, TemplateHaskell, RankNTypes, LambdaCase, ScopedTypeVariables #-}
+{-# LANGUAGE BangPatterns, TemplateHaskell, Rank2Types, LambdaCase, ScopedTypeVariables #-}
 
-module Rewriting (
-  rewrite
+module Rewriting
+( rewrite
+-- only for debugging
+, goM
+, ztrans
+, exs
+, testGoM
 ) where
 
 import Typechecking
@@ -21,10 +26,16 @@ import Data.Generics.Schemes (everywhere, listify, something)
 import Data.Generics.Basics  (Data(gmapM), Typeable)
 import Data.Generics.Text    (gshow)
 
+-- syz
+import Data.Generics.Zipper
+
 -- mtl & transformers
 import Control.Monad.Trans.State.Strict (StateT(runStateT), get, put)
 import Control.Monad.Trans.Class (MonadTrans(lift))
 import Control.Monad.State.Class ()
+
+-- monad utilities in base
+import Control.Monad ( (<=<) )
 
 -- debug
 import Debug.Trace (trace)
@@ -112,8 +123,66 @@ isMatch :: Match -> Bool
 isMatch GHC.Match {} = True
 isMatch _ = False
 
+exs :: [[Int]]
+exs = do
+  len <- [2 .. 5]
+  pure $ take len $ drop (2 * len - 1) [9, 8 .. 1]
+
+ztrans :: Monad m => Zipper a -> m (Zipper a)
+ztrans = goM pure undefined where f x | trace (gshow x) True = pure x; f _ = undefined
+
+testGoM :: Maybe [[Int]]
+testGoM = fromZipper <$>
+  goM
+    (\x -> trace (gshow x) $ pure x)
+    (\z -> trace (("react: " ++) . show $ fromZipper z) $ pure z)
+    (toZipper exs)
+
+goM :: Monad m => (forall d. Data d => d -> m d) -> (Zipper a -> m (Zipper a)) -> Zipper a -> m (Zipper a)
+goM trns react zipr' = do
+  -- transform the current node
+  zipr <- transM trns zipr'
+  -- with the node transformed, run the entire thing on the leftmost child
+  -- if there are no children, run the entire thing on the right sibling
+  -- if there are no siblings to the right, there's nothing more to do
+
+  -- after transforming the right thing, before returning to parent in downM,
+  -- we react to a stack pop (hopefully)
+  flip rightM
+    (goM trns react)
+    (downM (pure zipr) (react <=< (goM trns react . leftmost)) zipr)
+    zipr
+
+
+-- | Apply a generic monadic transformer using the specified movement operations.
+myM :: (Monad m)
+      => (Zipper a -> Maybe (Zipper a)) -- ^ Move to
+      -> (Zipper a -> Maybe (Zipper a)) -- ^ Move back
+      -> m (Zipper a) -- ^ Default if can't move
+      -> (Zipper a -> m (Zipper a)) -- ^ Monadic transformer if can move
+      -> Zipper a -- ^ Zipper
+      -> m (Zipper a)
+myM move1 move2 b f =
+  -- move, transform (with f), then move back
+  moveQ move1 b (moveQ move2 b return <=< f)
+
+
+{-
+what we'd like to do:
+we need to "react" to a return from a child in some way. There's state to be restored
+(so I guess a typeclass? sth like Stackable?) when we return from child nodes,
+but there's also a part of the state that we need to carry over child transformations.
+
+So when does the return happen? Could we achieve something like this with just the standard
+typeclass machinery? I think we could adapt Monoid somehow to do this kind of thing for us
+
+so a return is essentially the step before we move right
+-}
+
 rewrite :: GHC.LHsBinds GHC.GhcTc -> GHC.TcM (GHC.LHsBinds GHC.GhcTc)
-rewrite binds = fst <$> (`runStateT` initialState) (everywhereM' trans binds)
+-- here we'd like to switch to a zipper approach to keep control over movement through the tree
+rewrite binds = undefined -- trace (gshow [42, 24 :: Int]) $ fromZipper <$> ztrans (toZipper exs)
+  -- fst <$> (`runStateT` initialState) (everywhereM' trans binds)
   where
 
   initialState = WS {ws_fun = Nothing, ws_callCounter = Nothing}

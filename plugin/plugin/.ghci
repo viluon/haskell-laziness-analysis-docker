@@ -1,0 +1,9 @@
+:set -package ghc
+:set -package template-haskell
+:set -package syb
+:set -package mtl
+:set -package transformers
+:set -package ghc-heap-view
+:set -package time
+:set -package containers
+:set -package syz
