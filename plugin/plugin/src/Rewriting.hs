@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns, TemplateHaskell, Rank2Types, LambdaCase, ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications, DeriveDataTypeable, DeriveFunctor, DeriveFoldable, AllowAmbiguousTypes #-}
 
 module Rewriting
 ( rewrite
@@ -6,7 +7,9 @@ module Rewriting
 , goM
 , ztrans
 , exs
+, trexs
 , testGoM
+, testGoM2
 ) where
 
 import Typechecking
@@ -23,7 +26,7 @@ import qualified GHC
 -- syb
 import Data.Generics.Aliases (extM, extT, mkM, mkQ, mkT, GenericM)
 import Data.Generics.Schemes (everywhere, listify, something)
-import Data.Generics.Basics  (Data(gmapM), Typeable)
+import Data.Generics.Basics  (Data(gmapM), Typeable, cast)
 import Data.Generics.Text    (gshow)
 
 -- syz
@@ -35,7 +38,10 @@ import Control.Monad.Trans.Class (MonadTrans(lift))
 import Control.Monad.State.Class ()
 
 -- monad utilities in base
-import Control.Monad ( (<=<) )
+import Control.Monad ( (<=<), (>=>) )
+
+-- function utilities in base
+import Data.Function ( (&) )
 
 -- debug
 import Debug.Trace (trace)
@@ -59,14 +65,17 @@ everywhereM' f = go
 indentWithRangle :: String -> String
 indentWithRangle = unlines . fmap ("> " ++) . lines
 
+switch :: a -> (a -> a -> b) -> b
+switch a f = f a a
+
 collectFunInfo :: Bind -> StateT WrapperState GHC.TcM Bind
 collectFunInfo bind =
-  let name = case bind of
-        GHC.FunBind  {} -> Right $ GHC.varName . GHC.unLoc . GHC.fun_id $ bind
-        GHC.PatBind  {} -> Left  "pat bind"
-        GHC.VarBind  {} -> Right $ GHC.varName . GHC.var_id $ bind
-        GHC.AbsBinds {} -> Left  "abs bind"
-        _               -> Left  . ("unsupported Bind extension:\n" ++) . GHC.showSDocUnsafe . GHC.ppr $ bind
+  let name = bind `switch` \case
+        GHC.FunBind  {} -> Right . GHC.varName . GHC.unLoc . GHC.fun_id
+        GHC.PatBind  {} -> Left  . const "pat bind"
+        GHC.VarBind  {} -> Right . GHC.varName . GHC.var_id
+        GHC.AbsBinds {} -> Left  . const "abs bind"
+        _               -> Left  . ("unsupported Bind extension:\n" ++) . GHC.showSDocUnsafe . GHC.ppr
   in case name of
     Right !nm | "call_number" /= occNameStr nm ->
       trace (indentWithRangle . occNameStr $ nm) $
@@ -128,31 +137,62 @@ exs = do
   len <- [2 .. 5]
   pure $ take len $ drop (2 * len - 1) [9, 8 .. 1]
 
+data Tree a = Leaf | Branch a (Tree a) (Tree a) deriving (Eq, Show, Data, Functor, Foldable)
+
+buildTree :: [a] -> Tree a
+buildTree []      = Leaf
+buildTree (x:xs)  = let (l, r) = splitAt 4 xs
+                    in x `Branch` buildTree l $ buildTree r
+
+trexs :: Tree Int
+trexs = buildTree $ concat exs
+
 ztrans :: Monad m => Zipper a -> m (Zipper a)
 ztrans = goM pure undefined where f x | trace (gshow x) True = pure x; f _ = undefined
 
+dincr :: Data d => d -> d
+dincr = mkT (+ (1 :: Int))
+
+orElse :: Maybe a -> Maybe a -> Maybe a
+orElse (Just a) _        = Just a
+orElse _        (Just a) = Just a
+orElse _        _        = Nothing
+
+showHole :: forall a b. (Typeable a, Show a) => Zipper b -> Maybe String
+showHole = fmap show . getHole @a
+
 testGoM :: Maybe [[Int]]
-testGoM = fromZipper <$>
+testGoM =
+  fromZipper
+    <$> goM
+      (\x -> trace (gshow x) $ pure $ dincr x)
+      (\z -> trace ("react: " ++ show (
+        showHole @Int z <> showHole @[Int] z <> showHole @[[Int]] z)
+        ) $ pure z)
+      (toZipper exs)
+
+testGoM2 :: Maybe (Tree Int)
+testGoM2 = fromZipper <$>
   goM
-    (\x -> trace (gshow x) $ pure x)
-    (\z -> trace (("react: " ++) . show $ fromZipper z) $ pure z)
-    (toZipper exs)
+    (\x -> trace (("trns: " ++) $ gshow x) $ pure $ dincr x)
+    (\z -> trace (("react: " ++) . show . getHole @Int $ z) $ pure z)
+    (toZipper trexs)
 
 goM :: Monad m => (forall d. Data d => d -> m d) -> (Zipper a -> m (Zipper a)) -> Zipper a -> m (Zipper a)
 goM trns react zipr' = do
   -- transform the current node
   zipr <- transM trns zipr'
-  -- with the node transformed, run the entire thing on the leftmost child
-  -- if there are no children, run the entire thing on the right sibling
-  -- if there are no siblings to the right, there's nothing more to do
-
-  -- after transforming the right thing, before returning to parent in downM,
-  -- we react to a stack pop (hopefully)
-  flip rightM
-    (goM trns react)
-    (downM (pure zipr) (react <=< (goM trns react . leftmost)) zipr)
-    zipr
-
+  -- bs bs bs bs
+  -- we wanna do this: solve it for children, left to right
+  -- then "pop" and solve it here
+  -- hmm is that so or do we move the local solving to the front, huh?
+  -- top-down is trns as the first step, bottom-up is trns as the last step
+  -- i'm stupid
+  pure
+    >=> downM  (pure zipr) (goM trns react . leftmost)
+    >=> react
+    >=> rightM (pure zipr) (goM trns react           )
+    $ zipr
 
 -- | Apply a generic monadic transformer using the specified movement operations.
 myM :: (Monad m)

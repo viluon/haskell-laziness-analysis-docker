@@ -42,3 +42,4 @@ library
                        -ferror-spans
                        -freverse-errors
                        -fprint-expanded-synonyms
+                       -fdiagnostics-color=always
