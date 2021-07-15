@@ -182,17 +182,12 @@ goM :: Monad m => (forall d. Data d => d -> m d) -> (Zipper a -> m (Zipper a)) -
 goM trns react zipr' = do
   -- transform the current node
   zipr <- transM trns zipr'
-  -- bs bs bs bs
   -- we wanna do this: solve it for children, left to right
-  -- then "pop" and solve it here
-  -- hmm is that so or do we move the local solving to the front, huh?
+  -- then "pop" and move to the right sibling
   -- top-down is trns as the first step, bottom-up is trns as the last step
-  -- i'm stupid
-  pure
-    >=> downM  (pure zipr) (goM trns react . leftmost)
-    >=> react
-    >=> rightM (pure zipr) (goM trns react           )
-    $ zipr
+  zipr <- downM (pure zipr) (goM trns react . leftmost) zipr
+  zipr <- react zipr
+  rightM (pure zipr) (goM trns react) zipr
 
 -- | Apply a generic monadic transformer using the specified movement operations.
 myM :: (Monad m)
