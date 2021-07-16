@@ -1,6 +1,6 @@
 module Typechecking (
   -- types
-  Bind, RHS, LExpr, GenLocSpan, Match,
+  Bind, Binds, RHS, LExpr, GenLocSpan, Match,
 
   -- utilities
   (~>), tc, toTyped, occNameStr,
@@ -28,6 +28,7 @@ import qualified Language.Haskell.TH as TH
 
 
 type Bind  = GHC.HsBindLR GHC.GhcTc GHC.GhcTc
+type Binds = GHC.LHsBinds GHC.GhcTc
 
 type RHS        = GHC.GRHS       GHC.GhcTc LExpr
 type LExpr      = GHC.LHsExpr    GHC.GhcTc

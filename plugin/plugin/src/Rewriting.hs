@@ -38,7 +38,8 @@ import Control.Monad.Trans.Class (MonadTrans(lift))
 import Control.Monad.State.Class ()
 
 -- monad utilities in base
-import Control.Monad ( (<=<), (>=>) )
+-- monad utilities in base
+import Control.Monad ( (<=<), (>=>), join )
 
 -- function utilities in base
 import Data.Function ( (&) )
@@ -65,12 +66,12 @@ everywhereM' f = go
 indentWithRangle :: String -> String
 indentWithRangle = unlines . fmap ("> " ++) . lines
 
-switch :: a -> (a -> a -> b) -> b
-switch a f = f a a
-
 collectFunInfo :: Bind -> StateT WrapperState GHC.TcM Bind
 collectFunInfo bind =
-  let name = bind `switch` \case
+  -- the 'flip join' is like a switch statement: we match on bind defining a
+  -- function *taking bind* in every case. The case-specific function is applied
+  -- immediately. The arms that don't need the bind start with const.
+  let name = flip join bind $ \case
         GHC.FunBind  {} -> Right . GHC.varName . GHC.unLoc . GHC.fun_id
         GHC.PatBind  {} -> Left  . const "pat bind"
         GHC.VarBind  {} -> Right . GHC.varName . GHC.var_id
@@ -214,11 +215,17 @@ typeclass machinery? I think we could adapt Monoid somehow to do this kind of th
 so a return is essentially the step before we move right
 -}
 
-rewrite :: GHC.LHsBinds GHC.GhcTc -> GHC.TcM (GHC.LHsBinds GHC.GhcTc)
+zGoM :: (Monad m, Data a) => (forall d. Data d => d -> m d) -> (Zipper a -> m (Zipper a)) -> a -> m a
+zGoM f r = fmap fromZipper . goM f r . toZipper
+
+rewrite :: Binds -> GHC.TcM Binds
 -- here we'd like to switch to a zipper approach to keep control over movement through the tree
-rewrite binds = undefined -- trace (gshow [42, 24 :: Int]) $ fromZipper <$> ztrans (toZipper exs)
+rewrite binds = fst <$> runStateT (zGoM trans react binds) initialState
   -- fst <$> (`runStateT` initialState) (everywhereM' trans binds)
   where
+
+  react :: Zipper Binds -> StateT WrapperState GHC.TcM (Zipper Binds)
+  react = _r
 
   initialState = WS {ws_fun = Nothing, ws_callCounter = Nothing}
 
