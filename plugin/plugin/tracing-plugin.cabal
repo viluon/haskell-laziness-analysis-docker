@@ -15,7 +15,7 @@ library
   exposed-modules:     TracingPlugin
 
   -- Modules included in this library but not exported.
-  other-modules:       Typechecking, Rewriting, Logging
+  other-modules:       Typechecking, Rewriting, Logging, Zipping
 
   -- LANGUAGE extensions used by modules in this package.
   -- other-extensions:
@@ -31,6 +31,7 @@ library
                      , time
                      , containers
                      , syz
+                     , QuickCheck
   -- Directories containing source files.
   hs-source-dirs:      src
 
@@ -43,3 +44,4 @@ library
                        -freverse-errors
                        -fprint-expanded-synonyms
                        -fdiagnostics-color=always
+                       -O0

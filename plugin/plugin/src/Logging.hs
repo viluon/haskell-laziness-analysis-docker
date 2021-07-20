@@ -1,7 +1,13 @@
 {-# LANGUAGE TupleSections #-}
 
-module Logging (
-  traceEntry, traceArg
+module Logging
+( traceEntry
+, traceArg
+, trace
+, trace'
+, trace''
+, trace'''
+, pprWithoutNull
 ) where
 
 -- unsafe features
@@ -10,9 +16,16 @@ import System.IO.Unsafe (unsafePerformIO)
 -- IO
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import System.IO
+import System.Environment
+
+-- utilities from base
+import Data.Maybe
 
 -- time
 import Data.Time.Clock.System (getSystemTime, SystemTime(..))
+
+-- ghc
+import qualified Outputable as GHC (Outputable, ppr, showSDocUnsafe)
 
 -- ghc-heap-view
 import qualified GHC.HeapView as GHC
@@ -23,15 +36,21 @@ import Control.Concurrent (myThreadId)
 -- containers
 import qualified Data.Map.Strict as M
 
+-- debug
+import qualified Debug.Trace as Dbg (trace)
+
 
 data TraceSort = ArgTrace | EntryTrace deriving (Eq, Show)
 
 {-# NOINLINE outputHandle #-}
 outputHandle :: IORef Handle
 outputHandle = unsafePerformIO $ do
-  -- TODO set the path with a CLI argument if possible
-  handle <- openFile "/tmp/trace.csv" AppendMode
-  newIORef handle
+  path <- fromMaybe "/tmp/trace.csv" <$> lookupEnv "HS_TRACING_OUTPUT"
+  handle <- openFile path AppendMode
+  writable <- hIsWritable handle
+  if writable
+  then newIORef handle
+  else error $ "Dynamic tracing GHC plugin: Cannot write to \n'" ++ path ++ "'"
 
 logt :: TraceSort -> [String] -> IO ()
 logt sort params = do
@@ -88,3 +107,13 @@ traceArg funName arg callNumber x = unsafePerformIO $ do
     , closureType closure
     ]
   return x
+
+-- debugging utilities
+
+colourfulTrace :: Int -> String -> a -> a
+colourfulTrace c str = Dbg.trace $ concat ["\ESC[3", show c, "m", str, "\ESC[0m"]
+
+trace : trace' : trace'' : trace''' : _ = colourfulTrace <$> [2..]
+
+pprWithoutNull :: GHC.Outputable a => a -> String
+pprWithoutNull = filter (/= '\0') . GHC.showSDocUnsafe . GHC.ppr

@@ -1,26 +1,20 @@
 {-# LANGUAGE BangPatterns, TemplateHaskell, Rank2Types, LambdaCase, ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications, DeriveDataTypeable, DeriveFunctor, DeriveFoldable, AllowAmbiguousTypes #-}
+{-# LANGUAGE TypeApplications #-}
 
 module Rewriting
 ( rewrite
--- only for debugging
-, goM
-, ztrans
-, exs
-, trexs
-, testGoM
-, testGoM2
 ) where
 
 import Typechecking
 import Logging
+import Zipping
 
 -- ghc
 import qualified TcRnMonad  as GHC
 import qualified TcHsSyn    as GHC (zonkTopLExpr)
 import qualified TysWiredIn as GHC (intTy)
 import qualified Var        as GHC (varName)
-import qualified Outputable as GHC (ppr, showSDocUnsafe)
+import qualified Outputable as GHC (Outputable, ppr, showSDocUnsafe)
 import qualified GHC
 
 -- syb
@@ -33,25 +27,27 @@ import Data.Generics.Text    (gshow)
 import Data.Generics.Zipper
 
 -- mtl & transformers
-import Control.Monad.Trans.State.Strict (StateT(runStateT), get, put)
+import Control.Monad.Trans.State.Strict (StateT(runStateT), get, put, gets, modify')
 import Control.Monad.Trans.Class (MonadTrans(lift))
 import Control.Monad.State.Class ()
 
 -- monad utilities in base
--- monad utilities in base
-import Control.Monad ( (<=<), (>=>), join )
+import Control.Monad ( (<=<), (>=>), join, when, unless )
 
--- function utilities in base
+-- utilities in base
 import Data.Function ( (&) )
-
--- debug
-import Debug.Trace (trace)
+import Data.Maybe (isJust, listToMaybe, fromJust)
 
 
-data WrapperState = WS { ws_fun         :: Maybe GHC.Name
+data WrapperState = WS { ws_fun          :: Maybe GHC.Name
                          -- ^ the function we're inside of
-                       , ws_callCounter :: Maybe GHC.Id
-                         -- ^ the reference to the Int denoting the number of the current function call
+                       , ws_callCounters :: [GHC.Id]
+                         -- ^ the stack of references to the Ints, each denoting
+                         --   the number of the current function call. The stack
+                         --   follows the nesting of λ-abstractions.
+                       , ws_incrCCSuccess :: Bool
+                         -- ^ a horrible ad-hoc thing that I will go to hell for.
+                         --   FIXME: Get rid of this ASAP.
                        }
 
 -- like everywhereM, but top-down
@@ -67,7 +63,7 @@ indentWithRangle :: String -> String
 indentWithRangle = unlines . fmap ("> " ++) . lines
 
 collectFunInfo :: Bind -> StateT WrapperState GHC.TcM Bind
-collectFunInfo bind =
+collectFunInfo bind | trace' "collectFunInfo" True =
   -- the 'flip join' is like a switch statement: we match on bind defining a
   -- function *taking bind* in every case. The case-specific function is applied
   -- immediately. The arms that don't need the bind start with const.
@@ -82,10 +78,12 @@ collectFunInfo bind =
       trace (indentWithRangle . occNameStr $ nm) $
         do
           state <- get
-          put state {ws_fun = Just nm}
+          trace'' ("the top-level fun is " ++ pprWithoutNull nm) $ pure ()
+          put $! state {ws_fun = Just nm}
           return bind
     Left msg -> trace ("  (" ++ msg ++ ")") $ return bind
     _        ->                               return bind
+collectFunInfo _ = error "impossible"
 
 dummyBinding :: a
 dummyBinding = undefined
@@ -93,7 +91,8 @@ dummyBinding = undefined
 incrementCallCounter :: RHS -> StateT WrapperState GHC.TcM RHS
 incrementCallCounter (GHC.GRHS x guards lexpr@(GHC.L span _))
   | {- TODO: come up with a more robust solution -} span /= GHC.noSrcSpan = do
-  WS {ws_fun = Just funName} <- get
+  trace' "incrementCC" $ pure ()
+  WS {ws_fun = Just funName, ws_callCounters = counters} <- get
   let funName' = occNameStr funName
   -- build the let expression for the call_number variable
   Just (_, org_ty) <- lift $ toTyped lexpr
@@ -109,13 +108,15 @@ incrementCallCounter (GHC.GRHS x guards lexpr@(GHC.L span _))
 
   -- update state
   !state <- get
-  put state {ws_callCounter = Just var}
+  put state {ws_callCounters = var : counters}
 
   -- apply the λ-wrapped let binder to the original expression
   !completeExpr <- lift . GHC.zonkTopLExpr $ everywhere (mkT removeSrcSpans `extT` replaceDummyWith lexpr) letExpr
 
-  GHC.liftIO . putStrLn . GHC.showSDocUnsafe $ GHC.ppr completeExpr
-  return $ GHC.GRHS x guards completeExpr
+  -- FIXME: adhocbomination
+  modify' $ \s -> s {ws_incrCCSuccess = True}
+  trace''' (("incrCC result:\n" ++) . pprWithoutNull $ completeExpr) $ pure ()
+  return $! GHC.GRHS x guards completeExpr
 
   where
     removeSrcSpans :: GenLocSpan LExpr -> GenLocSpan LExpr
@@ -127,112 +128,63 @@ incrementCallCounter (GHC.GRHS x guards lexpr@(GHC.L span _))
         | "dummyBinding" == occNameStr x -> replacement
       x -> x
 
-incrementCallCounter x = return x
+incrementCallCounter x = pure x
 
 isMatch :: Match -> Bool
 isMatch GHC.Match {} = True
 isMatch _ = False
 
-exs :: [[Int]]
-exs = do
-  len <- [2 .. 5]
-  pure $ take len $ drop (2 * len - 1) [9, 8 .. 1]
-
-data Tree a = Leaf | Branch a (Tree a) (Tree a) deriving (Eq, Show, Data, Functor, Foldable)
-
-buildTree :: [a] -> Tree a
-buildTree []      = Leaf
-buildTree (x:xs)  = let (l, r) = splitAt 4 xs
-                    in x `Branch` buildTree l $ buildTree r
-
-trexs :: Tree Int
-trexs = buildTree $ concat exs
-
-ztrans :: Monad m => Zipper a -> m (Zipper a)
-ztrans = goM pure undefined where f x | trace (gshow x) True = pure x; f _ = undefined
-
-dincr :: Data d => d -> d
-dincr = mkT (+ (1 :: Int))
-
-orElse :: Maybe a -> Maybe a -> Maybe a
-orElse (Just a) _        = Just a
-orElse _        (Just a) = Just a
-orElse _        _        = Nothing
-
-showHole :: forall a b. (Typeable a, Show a) => Zipper b -> Maybe String
-showHole = fmap show . getHole @a
-
-testGoM :: Maybe [[Int]]
-testGoM =
-  fromZipper
-    <$> goM
-      (\x -> trace (gshow x) $ pure $ dincr x)
-      (\z -> trace ("react: " ++ show (
-        showHole @Int z <> showHole @[Int] z <> showHole @[[Int]] z)
-        ) $ pure z)
-      (toZipper exs)
-
-testGoM2 :: Maybe (Tree Int)
-testGoM2 = fromZipper <$>
-  goM
-    (\x -> trace (("trns: " ++) $ gshow x) $ pure $ dincr x)
-    (\z -> trace (("react: " ++) . show . getHole @Int $ z) $ pure z)
-    (toZipper trexs)
-
-goM :: Monad m => (forall d. Data d => d -> m d) -> (Zipper a -> m (Zipper a)) -> Zipper a -> m (Zipper a)
-goM trns react zipr' = do
-  -- transform the current node
-  zipr <- transM trns zipr'
-  -- we wanna do this: solve it for children, left to right
-  -- then "pop" and move to the right sibling
-  -- top-down is trns as the first step, bottom-up is trns as the last step
-  zipr <- downM (pure zipr) (goM trns react . leftmost) zipr
-  zipr <- react zipr
-  rightM (pure zipr) (goM trns react) zipr
-
--- | Apply a generic monadic transformer using the specified movement operations.
-myM :: (Monad m)
-      => (Zipper a -> Maybe (Zipper a)) -- ^ Move to
-      -> (Zipper a -> Maybe (Zipper a)) -- ^ Move back
-      -> m (Zipper a) -- ^ Default if can't move
-      -> (Zipper a -> m (Zipper a)) -- ^ Monadic transformer if can move
-      -> Zipper a -- ^ Zipper
-      -> m (Zipper a)
-myM move1 move2 b f =
-  -- move, transform (with f), then move back
-  moveQ move1 b (moveQ move2 b return <=< f)
-
-
-{-
-what we'd like to do:
-we need to "react" to a return from a child in some way. There's state to be restored
-(so I guess a typeclass? sth like Stackable?) when we return from child nodes,
-but there's also a part of the state that we need to carry over child transformations.
-
-So when does the return happen? Could we achieve something like this with just the standard
-typeclass machinery? I think we could adapt Monoid somehow to do this kind of thing for us
-
-so a return is essentially the step before we move right
--}
-
-zGoM :: (Monad m, Data a) => (forall d. Data d => d -> m d) -> (Zipper a -> m (Zipper a)) -> a -> m a
-zGoM f r = fmap fromZipper . goM f r . toZipper
-
 rewrite :: Binds -> GHC.TcM Binds
--- here we'd like to switch to a zipper approach to keep control over movement through the tree
-rewrite binds = fst <$> runStateT (zGoM trans react binds) initialState
-  -- fst <$> (`runStateT` initialState) (everywhereM' trans binds)
+rewrite binds = fst <$> runStateT (zggoM tranz react binds) initialState
   where
 
+  tranz :: Data a => Zipper a -> StateT WrapperState GHC.TcM (Zipper a)
+  tranz z = do
+    z <- transM trans z
+    -- `mkM` is `extM return`
+    modify' $ \s -> s {ws_incrCCSuccess = False}
+    z <- transM (mkM incrementCallCounter) z
+    WS {ws_incrCCSuccess = success} <- get
+    if success then
+      flip join (down z >>= down) $ \case
+        Just z  -> flip trace'' (pure z) . pprWithoutNull @(Maybe LExpr) . query cast . fromJust
+        Nothing -> error "this should never happen"
+    else pure z
+
   react :: Zipper Binds -> StateT WrapperState GHC.TcM (Zipper Binds)
-  react = _r
+  react z = do
+    let mrhs = query cast z
+    -- TODO this match is really ugly, the pattern should at least be given
+    -- a name and shared between incrementCallCounter and this place.
+    -- Ideally we'd avoid this double-check completely though, which may be
+    -- possible if we do multiple passes.
+    let shouldPop = case mrhs of
+          -- FIXME: so atm we seem to be failing the span /= GHC.noSrcSpan check,
+          --        because we react before the span is deleted (right before the
+          --        incrementCC invocation), and by the time we return we're no
+          --        longer in a RHS but in the parent node (so the trace here isn't
+          --        even called).
+          --        oops, after, not before, right? 'cause the span is missing
+          --        when we check here, and incrementCC removes it
+          Just (GHC.GRHS _ _ (GHC.L span e) :: RHS) | trace "shouldPop?" span == GHC.noSrcSpan
+            -> trace''' ("here comes the poppery\n" ++ gshow e) True
+          _ -> False
+    counters <- gets ws_callCounters
+    unless (null counters) $
+      -- we just matched an incrementCallCounter application
+      -- it's time to pop the latest counter from the stack,
+      -- as we're returning from the lambda body
+      trace'' ("would pop " ++ pprWithoutNull (listToMaybe counters)) $
+        modify' $ \s -> s {ws_callCounters = tail counters}
+    pure z
 
-  initialState = WS {ws_fun = Nothing, ws_callCounter = Nothing}
+  initialState = WS {ws_fun = Nothing, ws_callCounters = [], ws_incrCCSuccess = False}
 
-  -- the monadic transformation capturing function info,
-  -- introducing call number variables, and wrapping argument references
+  -- the monadic transformation capturing function info, ~~introducing call
+  -- number variables~~ (incrementCallCounter is now on holiday in
+  -- tranzylvania), and wrapping argument references
   trans :: Typeable a => a -> StateT WrapperState GHC.TcM a
-  trans = mkM collectFunInfo `extM` wrapRef `extM` incrementCallCounter
+  trans = mkM collectFunInfo `extM` wrapRef
 
   boundVars = do
     match <- listify isMatch binds
@@ -242,7 +194,7 @@ rewrite binds = fst <$> runStateT (zGoM trans react binds) initialState
       unl x = GHC.unLoc x
 
       lextract :: GHC.LPat GHC.GhcTc -> [GHC.Id]
-      lextract x = extractIds . unl $ x
+      lextract = extractIds . unl
 
       extractIds :: GHC.Pat GHC.GhcTc -> [GHC.Id]
       extractIds  GHC.WildPat   {}                       = []
@@ -271,24 +223,33 @@ rewrite binds = fst <$> runStateT (zGoM trans react binds) initialState
       extractIds  GHC.XPat      {}                       = error "unsupported extension of Pat"
 
   wrapRef :: LExpr -> StateT WrapperState GHC.TcM LExpr
-  wrapRef (GHC.L span v@(GHC.HsVar x lid))
+  wrapRef top@(GHC.L span v@(GHC.HsVar x lid)) =
+    trace''' (indentWithRangle $ unlines
+      [ "here's the deal: ", pprWithoutNull lid
+      , "and do we have a noSrcSpan?", show span
+      , "please enjoy this gshow output, it's on the house", gshow v ]) $
     -- make sure the Id is bound by some pattern and it's not a part of an already rewritten expression
-    | GHC.unLoc lid `elem` boundVars && span /= GHC.noSrcSpan = do
-      WS { ws_fun         = Just funName
-         , ws_callCounter = Just callCounter
+    if GHC.unLoc lid `elem` boundVars && span /= GHC.noSrcSpan then do
+      trace' "wrapRef" $ pure ()
+      WS { ws_fun          = Just funName
+         , ws_callCounters = counters@(callCounter : _)
          } <- get
 
-      let argName = occNameStr . GHC.varName . GHC.unLoc $ lid
+      let argName = trace
+            ("the other counters are " ++ pprWithoutNull counters)
+            . occNameStr . GHC.varName . GHC.unLoc $ lid
       let varWithoutSrcSpan = GHC.L GHC.noSrcSpan v
       let funName' = occNameStr funName
 
       Just (_, !org_ty) <- lift $ toTyped varWithoutSrcSpan
-      !pap <- lift $ tc (GHC.intTy ~> org_ty ~> org_ty) [| traceArg funName' argName |]
+      !pap <- lift $! tc (GHC.intTy ~> org_ty ~> org_ty) [| traceArg funName' argName |]
 
       let counter = GHC.L GHC.noSrcSpan $ GHC.HsVar GHC.NoExtField $ GHC.L GHC.noSrcSpan callCounter
       let !final_expr = GHC.mkHsApp (GHC.mkHsApp pap counter) varWithoutSrcSpan
 
       -- Zonk to instantiate type variables
-      lift $ GHC.zonkTopLExpr final_expr
+      res <- lift $! GHC.zonkTopLExpr final_expr
+      trace''' ("wrapRef result:\n" ++ pprWithoutNull res) $ pure res
+    else return top
 
   wrapRef e = return e
